@@ -197,6 +197,24 @@
       gap: 6px;
     }
 
+    .summary-card.altar {
+      border-color: var(--gold);
+      box-shadow: 0 0 14px rgba(245, 185, 66, 0.25);
+    }
+
+    .altar-line {
+      color: var(--gold);
+    }
+
+    .summary-card.streak {
+      border-color: var(--ok);
+      box-shadow: 0 0 14px rgba(46, 204, 113, 0.22);
+    }
+
+    .streak-line {
+      color: #7ee2a8;
+    }
+
     .rec-headline {
       font-size: 16px;
       font-weight: 700;
@@ -345,10 +363,67 @@
       // 가운데 선택지가 나오면 가운데를 추천해 데이터를 모으고, 그 뒤로는 데이터 기준 최선만 추천
       const CENTER_DATA_SD = 0.07;
 
-      const APP_VERSION = "ver.12";
+      const APP_VERSION = "ver.15";
       const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
 
       const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽" };
+
+      // 직전 강하 결과에 따라 사람처럼 반응하는 멘트 ({d} 내려온 층수, {n} 올라간 층수, {remain} 남은 횟수 안내, {dirRo} 추천 방향)
+      const DIR_RO = { left: "왼쪽으로", center: "가운데로", right: "오른쪽으로" };
+      const MOVE_CHEERS = {
+        ascent: [
+          "아, {n}층 위로 올라가 버렸네요… 이번엔 운이 따라주지 않았어요. {remain}{dirRo} 다시 내려가 봅시다!",
+          "상승이 나와 버렸네요, 정말 아쉬워요. 이번엔 제대로 추천해 볼게요. {dirRo} 가 봅시다!"
+        ],
+        tiny: [
+          "앗, {d}층밖에 못 내려왔네요… 이번엔 제대로 추천해 볼게요. {dirRo} 가 봅시다!",
+          "{d}층이라니, 제 추천이 빗나갔네요. 이번엔 {dirRo} 크게 노려봅시다!",
+          "아쉽게 {d}층에 그쳤어요. {remain}{dirRo} 가 봅시다!"
+        ],
+        small: [
+          "{d}층, 조금 아쉬운 강하였어요. {remain}이번엔 {dirRo} 더 깊이 가 봅시다!",
+          "{d}층 내려왔어요. 나쁘진 않지만 아쉽네요, {dirRo} 더 욕심내 봅시다!"
+        ],
+        good: [
+          "{d}층, 괜찮게 내려왔어요! 이 흐름 그대로 {dirRo} 가 봅시다!",
+          "{d}층 강하, 좋습니다! {dirRo} 쭉 이어가 봅시다!"
+        ],
+        great: [
+          "{d}층 대박 강하! 이 기세로 {dirRo} 더 깊이 가 봅시다!",
+          "와, {d}층이나 내려왔어요! 오늘 운이 좋네요. {dirRo} 가 봅시다!"
+        ],
+        grand: [
+          "대강하 성공! {d}층을 한 번에 내려왔어요. 이 기세로 {dirRo} 가 봅시다!"
+        ]
+      };
+
+      function moveCheer(direction, turns) {
+        const mv = state.lastMove;
+        if (!mv || mv.to !== state.floor) return null;
+        const d = mv.to - mv.from;
+        let kind;
+        if (d < 0) kind = "ascent";
+        else if (d >= GRAND_MIN && mv.direction === "center" && isGamblePoint(mv.from)) kind = "grand";
+        else if (d <= 4) kind = "tiny";
+        else if (d <= 9) kind = "small";
+        else if (d <= 14) kind = "good";
+        else kind = "great";
+        const remain = turns >= 2 ? `아직 ${turns}번 남았으니 충분히 만회할 수 있어요. `
+          : (turns === 1 ? "마지막 한 번 남았어요. " : "");
+        const list = MOVE_CHEERS[kind];
+        return list[state.cheerIndex % list.length]
+          .replace("{d}", d).replace("{n}", -d).replace("{remain}", remain).replace("{dirRo}", DIR_RO[direction]);
+      }
+
+      // 판 종료 시 최종 층수에 따른 멘트
+      function finishCheer(f) {
+        if (f >= MAX_FLOOR) return "100층 도달! 완벽한 판이었어요. 정말 수고하셨습니다!";
+        if (f >= 90) return `${f}층 마무리! 이번 판은 정말 대박이었어요. 수고하셨습니다!`;
+        if (f >= 70) return `${f}층 마무리, 꽤 깊이 내려왔네요. 수고하셨습니다!`;
+        if (f >= 50) return `${f}층에서 마무리됐어요. 무난한 판이었어요, 수고하셨습니다!`;
+        if (f >= 30) return `${f}층에서 끝났네요… 조금 아쉬운 판이었어요. 다음 열쇠는 더 깊이 가 봅시다!`;
+        return `${f}층에서 끝나 버렸네요… 이번 판은 많이 아쉬워요. 다음 열쇠로 꼭 만회해 봅시다!`;
+      }
 
       const CHEER_MESSAGES = {
         left: [
@@ -415,6 +490,10 @@
         departureRec: null,    // 기록에 남길 '출발 당시 추천'
         lastMove: null,        // 직전 강하 { from, to, direction } (안내 문구용)
         ended: false,          // 판 종료 버튼(다시하기/나가기)이 확인됨
+        altarFloor: null,      // 제단 효과를 확인 중인 층 (11층 단위)
+        altarUntil: 0,         // 제단 안내 문구를 읽을 시한
+        altarEffect: null,     // 확인된 제단 효과 { name, desc }
+        runDeltas: [],         // 이번 판의 강하 층수 기록 (연속 강하 보너스 확인용)
         endedHits: 0,
         lastParsed: null,
         abyssHits: 0,
@@ -440,6 +519,7 @@
         recHeadline: document.getElementById("recHeadline"),
         recDetail: document.getElementById("recDetail"),
         cheerText: document.getElementById("cheerText"),
+        summaryCard: document.querySelector(".summary-card"),
         video: document.getElementById("hiddenVideo"),
         hudCanvas: document.getElementById("hudCanvas"),
         cards: {
@@ -837,7 +917,7 @@
           rec.headline = f >= MAX_FLOOR ? "100층 도달! 이번 판이 종료되었습니다"
             : (r === 0 ? "남은 강하 0회 · 이번 판이 종료되었습니다" : "이번 판이 종료되었습니다");
           rec.detail = [moveText(), `최종 ${floorText(f)} · 보상 ${stageOf(f)}단계. 다음 열쇠로 입장하면 자동으로 다시 추천합니다.`].filter(Boolean).join(" ");
-          rec.cheer = "수고하셨습니다! 다음 열쇠도 대박 층수 노려봅시다!";
+          rec.cheer = finishCheer(f);
           state.rec = rec;
           render();
           return;
@@ -870,10 +950,21 @@
         rec.detail = moveText();
 
         rec.headline = `지금은 '${LABEL[rec.direction]}' 추천`;
-        rec.cheer = CHEER_MESSAGES[rec.direction][state.cheerIndex % 3];
+        rec.cheer = moveCheer(rec.direction, r) || CHEER_MESSAGES[rec.direction][state.cheerIndex % 3];
         state.rec = rec;
         if (!state.departureLocked) state.departureRec = rec;
         render();
+      }
+
+      // 연속 강하: 마지막 강하와 같은 층수로 몇 번 연속 내려왔는지 (상승이 끼면 끊긴 것으로 봄)
+      function streakInfo() {
+        const d = state.runDeltas;
+        if (!d.length || !state.lastMove || state.lastMove.to !== state.floor) return null;
+        const unit = d[d.length - 1];
+        if (unit <= 0) return null;
+        let count = 0;
+        for (let i = d.length - 1; i >= 0 && d[i] === unit; i--) count++;
+        return { unit, count };
       }
 
       /* ==============================================================
@@ -896,8 +987,32 @@
         });
 
         el.recHeadline.textContent = rec.headline;
-        el.recDetail.textContent = rec.detail;
-        el.cheerText.textContent = rec.cheer;
+        const altar = state.altarEffect && state.altarFloor === state.floor ? state.altarEffect : null;
+        el.recDetail.textContent = "";
+        if (altar) {
+          const line = document.createElement("span");
+          line.className = "altar-line";
+          line.textContent = altar.name
+            ? `제단 효과 '${altar.name}' 획득! ${altar.desc}. `
+            : "제단 효과 획득! ";
+          el.recDetail.appendChild(line);
+        }
+        const streak = streakInfo();
+        const bonus = streak && streak.count >= 3;
+        if (bonus || (streak && streak.count === 2 && rec.active)) {
+          const line = document.createElement("span");
+          line.className = "streak-line";
+          line.textContent = bonus
+            ? `${streak.unit}층 ${streak.count}연속 강하! 연속 강하 보너스(골드·실링)가 이 층 바닥에 떨어집니다. `
+            : `${streak.unit}층 2연속 강하 중! 다음 강하도 ${streak.unit}층이면 연속 강하 보너스를 받습니다. `;
+          el.recDetail.appendChild(line);
+        }
+        if (rec.detail) el.recDetail.appendChild(document.createTextNode(rec.detail));
+        el.summaryCard.classList.toggle("altar", Boolean(altar));
+        el.summaryCard.classList.toggle("streak", Boolean(bonus) && !altar);
+        el.cheerText.textContent = bonus
+          ? "연속 강하 보너스 획득! 바닥에 떨어진 골드·실링 꼭 챙기세요!"
+          : (altar && rec.active ? "제단 효과 획득! 운이 따르고 있습니다, 이대로 깊게 내려가 봅시다!" : rec.cheer);
 
         if (!state.stream) {
           el.stateSummary.textContent = "좌측 상단 HUD 자동 인식 대기";
@@ -1070,6 +1185,7 @@
       }
 
       function resetForNewRun() {
+        state.runDeltas = [];
         state.ended = false;
         state.endedHits = 0;
         state.abyss = false;
@@ -1092,6 +1208,9 @@
             gamble: isGamblePoint(prev)
           });
           state.lastMove = { from: prev, to: newFloor, direction: dep.direction };
+          state.runDeltas.push(newFloor - prev);
+        } else if (prev !== null) {
+          state.runDeltas = []; // 이동을 놓쳤으면 연속 기록을 알 수 없으므로 초기화
         }
         if (newFloor === 0) resetForNewRun();
         state.floor = newFloor;
@@ -1190,6 +1309,46 @@
         return boxes.length ? boxes : null;
       }
 
+      /* 11층 단위 제단 효과: 화면 가운데 위에 '"상자+1" 효과를 획득하였습니다' 같은 안내가 뜸.
+       * 11층 단위 층에 도착한 뒤 잠깐 동안만 그 부분을 읽어, 공식 제단 효과 4종 중 무엇인지 알려 줌 */
+      const ALTAR_WATCH_MS = 10000;
+      const ALTAR_EFFECTS = [
+        { re: /풍\s?요/, name: "풍요", desc: "보상 상자 1개가 풍요 상자로 바뀝니다" },
+        { re: /상\s?자/, name: "상자+1", desc: "종료 시 보상 상자가 1개 추가됩니다" },
+        { re: /최\s?소|1\s?6\s?층/, name: "최소 16층", desc: "다음 강하는 최소 16층 이상 내려갑니다" },
+        { re: /강\s?하|이\s?동|횟\s?수|기\s?회/, name: "강하+1", desc: "강하 횟수가 1회 늘었습니다" }
+      ];
+
+      function parseAltarText(rawText) {
+        const t = (rawText || "").replace(/\s+/g, " ");
+        if (!/효\s?과\s?를?\s?획\s?득/.test(t)) return null;
+        const hit = ALTAR_EFFECTS.find(e => e.re.test(t));
+        return hit ? { name: hit.name, desc: hit.desc } : { name: null, desc: "" };
+      }
+
+      async function readAltarBanner() {
+        const v = el.video;
+        const vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
+        const sx = Math.floor(vw * 0.34), sy = Math.floor(vh * 0.115);
+        const sw = Math.floor(vw * 0.32), sh = Math.floor(vh * 0.08);
+        const W = 760, H = Math.max(60, Math.round(W * sh / sw));
+        const cv = state.bannerCanvas || (state.bannerCanvas = document.createElement("canvas"));
+        cv.width = W;
+        cv.height = H;
+        const ctx = cv.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(v, sx, sy, sw, sh, 0, 0, W, H);
+        const img = ctx.getImageData(0, 0, W, H);
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) {
+          const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          const g = 255 - Math.min(255, Math.max(0, (y - 60) * 255 / 140));
+          d[i] = d[i + 1] = d[i + 2] = g;
+        }
+        ctx.putImageData(img, 0, 0);
+        const { data } = await state.ocrWorker.recognize(cv);
+        return parseAltarText(data && data.text ? data.text : "");
+      }
+
       // 문제 확인용 화면: 주소 끝에 ?debug=1 을 붙였을 때만 보임 (일반 사용자에게는 표시 안 함)
       let debugBox = null;
       if (DEBUG) {
@@ -1214,7 +1373,8 @@
         [
           `${APP_VERSION} · 공유 화면 ${v.videoWidth}×${v.videoHeight}`,
           `읽은 글자${reused ? "(변화 없음)" : ""}${parsed.assisted ? "(보조 판독 사용)" : ""}: ${parsed.raw || "없음"}`,
-          `이번 판독: ${show(parsed.floor)}층 / ${show(parsed.turns)}회${parsed.ended ? " · 종료 버튼" : ""} → 확정: ${show(state.floor)}층 / ${show(state.turns)}회${state.ended ? " · 판 종료" : ""}`
+          `이번 판독: ${show(parsed.floor)}층 / ${show(parsed.turns)}회${parsed.ended ? " · 종료 버튼" : ""} → 확정: ${show(state.floor)}층 / ${show(state.turns)}회${state.ended ? " · 판 종료" : ""}`,
+          `제단: ${state.altarEffect ? (state.altarEffect.name || "효과") + " 확인" : (Date.now() < state.altarUntil ? state.altarFloor + "층 안내 확인 중" : "-")}`
         ].forEach(t => {
           const line = document.createElement("span");
           line.textContent = t;
@@ -1258,7 +1418,20 @@
             state.lastHudBits = crop.bits;
             state.watchBoxes = findWatchBoxes(data || {}, width, crop.canvas.height);
           }
+          // 11층 단위 층에 도착하면 제단 안내를 잠깐 동안 확인
+          if (parsed.floor && parsed.floor % 11 === 0 && parsed.floor !== state.altarFloor) {
+            state.altarFloor = parsed.floor;
+            state.altarUntil = Date.now() + ALTAR_WATCH_MS;
+            state.altarEffect = null;
+          }
           applyHudReading(parsed);
+          if (!state.altarEffect && Date.now() < state.altarUntil) {
+            const effect = await readAltarBanner();
+            if (effect) {
+              state.altarEffect = effect;
+              render();
+            }
+          }
           updateDebug(crop.canvas, parsed, canReuse);
         } catch (err) {
           console.warn("HUD 판독 중 오류:", err);
