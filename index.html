@@ -345,7 +345,7 @@
       // 가운데 선택지가 나오면 가운데를 추천해 데이터를 모으고, 그 뒤로는 데이터 기준 최선만 추천
       const CENTER_DATA_SD = 0.07;
 
-      const APP_VERSION = "ver.10";
+      const APP_VERSION = "ver.11";
       const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
 
       const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽" };
@@ -968,6 +968,7 @@
 
         const imgData = hctx.getImageData(0, 0, targetW, targetH);
         const d = imgData.data;
+        const color = new Uint8ClampedArray(d); // 보조 판독용 원본 색
         const bits = new Uint8Array(targetW * targetH);
         // 밝은 글씨(흰색/금색)만 남겨 흰 바탕 검은 글씨로 변환 (OCR이 더 잘 읽는 형태)
         for (let y = 0; y < targetH; y++) {
@@ -983,7 +984,30 @@
           }
         }
         hctx.putImageData(imgData, 0, 0);
-        return { canvas: c, bits };
+        return { canvas: c, bits, color, width: targetW, height: targetH };
+      }
+
+      // 보조 판독용 회색조 이미지: 공유 화면은 색 정보가 절반 해상도로 줄어 전달되어
+      // 금색 숫자(남은 강하 횟수)가 흑백 변환에서 깨질 수 있으므로, 밝기 기준 회색조로 한 번 더 읽음
+      function makeGrayCanvas(crop, mode) {
+        const cv = state.grayCanvas || (state.grayCanvas = document.createElement("canvas"));
+        cv.width = crop.width;
+        cv.height = crop.height;
+        const ctx = cv.getContext("2d", { willReadFrequently: true });
+        const out = ctx.createImageData(crop.width, crop.height);
+        const src = crop.color, dst = out.data;
+        const lo = mode === "luma" ? 60 : 70;
+        const hi = mode === "luma" ? 200 : 210;
+        for (let i = 0; i < src.length; i += 4) {
+          const v = mode === "luma"
+            ? 0.299 * src[i] + 0.587 * src[i + 1] + 0.114 * src[i + 2]
+            : Math.max(src[i], src[i + 1], src[i + 2]);
+          const g = 255 - Math.min(255, Math.max(0, (v - lo) * 255 / (hi - lo)));
+          dst[i] = dst[i + 1] = dst[i + 2] = g;
+          dst[i + 3] = 255;
+        }
+        ctx.putImageData(out, 0, 0);
+        return cv;
       }
 
       function countBitDiff(a, b) {
@@ -1167,7 +1191,7 @@
         debugBox.lastChild.innerHTML = "";
         [
           `${APP_VERSION} · 공유 화면 ${v.videoWidth}×${v.videoHeight}`,
-          `읽은 글자${reused ? "(변화 없음)" : ""}: ${parsed.raw || "없음"}`,
+          `읽은 글자${reused ? "(변화 없음)" : ""}${parsed.assisted ? "(보조 판독 사용)" : ""}: ${parsed.raw || "없음"}`,
           `이번 판독: ${show(parsed.floor)}층 / ${show(parsed.turns)}회 → 확정: ${show(state.floor)}층 / ${show(state.turns)}회`
         ].forEach(t => {
           const line = document.createElement("span");
@@ -1195,7 +1219,18 @@
           } else {
             state.lastOcrAt = now;
             const { data } = await state.ocrWorker.recognize(crop.canvas, {}, { text: true, blocks: true });
-            parsed = parseHudText(data && data.text ? data.text : "");
+            const text = data && data.text ? data.text : "";
+            parsed = parseHudText(text);
+            // 글자 줄은 보이는데 숫자를 못 읽었으면 회색조로 다시 읽어 빈 값만 채움
+            for (const mode of ["luma", "max"]) {
+              const needTurns = parsed.turns === null && /[강감]\s?[하허]|가\s?[능늠]/.test(text);
+              const needFloor = parsed.floor === null && /지\s?[하허히]|로\s?비/.test(text);
+              if (!needTurns && !needFloor) break;
+              const r2 = await state.ocrWorker.recognize(makeGrayCanvas(crop, mode));
+              const p2 = parseHudText(r2.data && r2.data.text ? r2.data.text : "");
+              if (needTurns && p2.turns !== null) { parsed.turns = p2.turns; parsed.assisted = true; }
+              if (needFloor && p2.floor !== null) { parsed.floor = p2.floor; parsed.assisted = true; }
+            }
             state.lastParsed = parsed;
             state.lastHudBits = crop.bits;
             state.watchBoxes = findWatchBoxes(data || {}, width, crop.canvas.height);
