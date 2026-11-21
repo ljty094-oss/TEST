@@ -97,7 +97,7 @@
       border-radius: 12px;
       padding: 8px 12px;
       text-align: center;
-      min-width: 78px;
+      min-width: 84px;
     }
 
     .floor-badge .label {
@@ -235,6 +235,7 @@
       font-size: 12px;
       color: var(--muted);
       padding: 0 4px;
+      gap: 8px;
     }
 
     .hidden-capture {
@@ -254,7 +255,7 @@
       </div>
       <div class="btn-row">
         <div class="floor-badge">
-          <span class="label">현재 층수</span>
+          <span class="label">추정 층수</span>
           <span id="floorDisplay" class="value">-층</span>
         </div>
         <button id="toggleShareBtn" class="primary" type="button">화면 공유 시작</button>
@@ -278,13 +279,13 @@
 
     <div class="summary-card">
       <div id="recHeadline" class="rec-headline">공유를 시작하면 자동으로 추천합니다</div>
-      <div id="recDetail" class="rec-detail">누적 기록과 현재 층수 조건을 바탕으로 방향 점수를 계산합니다.</div>
+      <div id="recDetail" class="rec-detail">화면 변화량과 사용자별 누적 기록·열쇠 조건으로 방향 점수를 계산합니다.</div>
       <div id="cheerText" class="cheer-line">오늘도 대박 층수 노려봅시다!</div>
     </div>
 
     <div class="footer-bar">
-      <span id="recordCountText">누적 기록: 0건</span>
-      <button id="resetRecordsBtn" class="danger" type="button">기록 초기화</button>
+      <span id="recordCountText">내 기록: 0건 (ID: -)</span>
+      <button id="resetRecordsBtn" class="danger" type="button">내 기록 초기화</button>
     </div>
   </div>
 
@@ -294,7 +295,19 @@
   <script>
     (function () {
       const STORAGE_KEY = "hell_descent_simple_records_v1";
+      const EXTERNAL_DB_CONFIG = {
+        // 예: "https://xxxxxxxxxxxx.supabase.co" (비워두면 로컬 저장소만 사용)
+        supabaseUrl: "",
+        // Supabase anon public key (비워두면 로컬 저장소만 사용)
+        supabaseAnonKey: "",
+        // Supabase 테이블 이름 (기본: "hell_descent_records")
+        supabaseTable: "hell_descent_records",
+        // 선택: Firebase Realtime Database REST URL (예: "https://your-project.firebaseio.com/records.json") 또는 커스텀 웹훅 URL
+        customPostUrl: ""
+      };
+      const USER_ID_KEY = "hell_descent_user_id_v1";
       const CAPTURE_INTERVAL_MS = 3000;
+      const MIN_SCENE_DIFF_RATIO = 0.04;
 
       const KEY_LABELS = {
         hell: "지옥 열쇠",
@@ -326,10 +339,34 @@
         ]
       };
 
+      function getOrCreateUserId() {
+        try {
+          const urlParams = new URLSearchParams(window.location.search);
+          const customTag = (urlParams.get("u") || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 16);
+          if (customTag) {
+            localStorage.setItem(USER_ID_KEY, customTag);
+            return customTag;
+          }
+          let existing = localStorage.getItem(USER_ID_KEY);
+          if (existing) return existing;
+          const randPart = (window.crypto && window.crypto.randomUUID)
+            ? window.crypto.randomUUID().split("-")[0]
+            : Math.random().toString(36).slice(2, 8);
+          existing = `usr_${randPart}`;
+          localStorage.setItem(USER_ID_KEY, existing);
+          return existing;
+        } catch {
+          return "usr_guest";
+        }
+      }
+
+      const userId = getOrCreateUserId();
+
       const state = {
+        userId,
         stream: null,
         timerId: null,
-        lastFrameSignature: "",
+        lastSamplePixels: null,
         lastFloor: null,
         lastTurn: 0,
         keyType: "hell",
@@ -373,6 +410,68 @@
         }
       }
 
+      function getMyRecords() {
+        return state.records.filter(r => r.userId === state.userId);
+      }
+
+      function isSupabaseConfigured() {
+        return Boolean(
+          EXTERNAL_DB_CONFIG.supabaseUrl &&
+          EXTERNAL_DB_CONFIG.supabaseAnonKey &&
+          EXTERNAL_DB_CONFIG.supabaseTable
+        );
+      }
+
+      async function pushRecordToExternalDb(record) {
+        if (isSupabaseConfigured()) {
+          const baseUrl = EXTERNAL_DB_CONFIG.supabaseUrl.replace(/\/+$/, "");
+          const table = encodeURIComponent(EXTERNAL_DB_CONFIG.supabaseTable);
+          const endpoint = `${baseUrl}/rest/v1/${table}`;
+          try {
+            const res = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "apikey": EXTERNAL_DB_CONFIG.supabaseAnonKey,
+                "Authorization": `Bearer ${EXTERNAL_DB_CONFIG.supabaseAnonKey}`,
+                "Prefer": "return=minimal"
+              },
+              body: JSON.stringify({
+                user_id: record.userId,
+                recorded_at: new Date(record.ts).toISOString(),
+                floor: record.floor,
+                delta: record.delta,
+                direction: record.direction,
+                key_type: record.keyType,
+                grade: record.grade,
+                remaining_turns: record.remainingTurns,
+                gamble: record.gamble
+              })
+            });
+            if (!res.ok) {
+              console.warn("Supabase 저장 응답 오류:", res.status);
+            }
+          } catch (err) {
+            console.warn("Supabase 네트워크 전송 실패:", err);
+          }
+        }
+
+        if (EXTERNAL_DB_CONFIG.customPostUrl) {
+          try {
+            const res = await fetch(EXTERNAL_DB_CONFIG.customPostUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(record)
+            });
+            if (!res.ok) {
+              console.warn("외부 엔드포인트 응답 오류:", res.status);
+            }
+          } catch (err) {
+            console.warn("외부 엔드포인트 전송 실패:", err);
+          }
+        }
+      }
+
       function saveRecords() {
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state.records));
@@ -384,7 +483,8 @@
 
       function updateRecordCounter() {
         if (el.recordCountText) {
-          el.recordCountText.textContent = `누적 기록: ${state.records.length}건`;
+          const myCount = getMyRecords().length;
+          el.recordCountText.textContent = `내 기록: ${myCount}건 (ID: ${state.userId})`;
         }
       }
 
@@ -398,13 +498,36 @@
         if (el.recDetail) el.recDetail.textContent = detail;
       }
 
-      function computeFrameSignature(ctx, w, h) {
-        const sample = ctx.getImageData(0, 0, w, h).data;
-        let sum = 0;
-        for (let i = 0; i < sample.length; i += 64) {
-          sum = (sum + sample[i] + sample[i + 1] * 2 + sample[i + 2] * 3) % 1000000007;
+      function hasMeaningfulSceneChange(ctx, w, h) {
+        const img = ctx.getImageData(0, 0, w, h).data;
+        const sampled = [];
+        for (let i = 0; i < img.length; i += 32) {
+          sampled.push(img[i], img[i + 1], img[i + 2]);
         }
-        return String(sum);
+
+        if (!state.lastSamplePixels || state.lastSamplePixels.length !== sampled.length) {
+          state.lastSamplePixels = sampled;
+          return true;
+        }
+
+        let changedChannels = 0;
+        for (let i = 0; i < sampled.length; i += 3) {
+          const dr = Math.abs(sampled[i] - state.lastSamplePixels[i]);
+          const dg = Math.abs(sampled[i + 1] - state.lastSamplePixels[i + 1]);
+          const db = Math.abs(sampled[i + 2] - state.lastSamplePixels[i + 2]);
+          if (dr + dg + db > 45) {
+            changedChannels++;
+          }
+        }
+
+        const totalPixels = sampled.length / 3;
+        const diffRatio = changedChannels / totalPixels;
+        if (diffRatio < MIN_SCENE_DIFF_RATIO) {
+          return false;
+        }
+
+        state.lastSamplePixels = sampled;
+        return true;
       }
 
       function detectGameContext(ctx, w, h) {
@@ -414,7 +537,6 @@
           Math.floor(w * 0.14),
           Math.floor(h * 0.18)
         ).data;
-        const leftPanel = ctx.getImageData(0, 0, Math.floor(w * 0.22), Math.floor(h * 0.45)).data;
         const centerMsg = ctx.getImageData(
           Math.floor(w * 0.32),
           Math.floor(h * 0.62),
@@ -422,17 +544,10 @@
           Math.floor(h * 0.16)
         ).data;
 
-        let leftBright = 0;
         let crimsonCount = 0;
         let frostBlueCount = 0;
         let legendGoldCount = 0;
         let rareBlueCount = 0;
-
-        for (let i = 0; i < leftPanel.length; i += 16) {
-          const r = leftPanel[i];
-          const g = leftPanel[i + 1];
-          if (r > 180 && g > 160) leftBright++;
-        }
 
         for (let i = 0; i < keyBadgeArea.length; i += 12) {
           const r = keyBadgeArea[i];
@@ -474,41 +589,42 @@
           ? 12
           : Math.min(100, Math.max(1, state.lastFloor + stepJump));
 
-        const inferredRemaining = state.lastTurn === 0
+        const activeRemaining = state.lastTurn === 0
           ? (detectedGrade === "legend" ? 4 : 3)
-          : Math.max(0, state.remainingTurns - 1);
+          : state.remainingTurns;
 
         state.keyType = detectedKeyType;
         state.grade = detectedGrade;
-        state.remainingTurns = inferredRemaining;
+        state.remainingTurns = activeRemaining;
 
         return {
           floor: estimatedFloor,
           hasGambleAlert,
-          brightnessScore: leftBright
+          remainingAtTurn: activeRemaining
         };
       }
 
       function scoreDirection(direction, ctxInfo) {
         let score = 50;
-        const exactMatching = state.records.filter(
+        const myRecs = getMyRecords();
+        const exactMatching = myRecs.filter(
           r => r.direction === direction && r.keyType === state.keyType && r.grade === state.grade
         );
-        const keyMatching = state.records.filter(
+        const keyMatching = myRecs.filter(
           r => r.direction === direction && r.keyType === state.keyType
         );
         const fallbackMatching = exactMatching.length > 0
           ? exactMatching
           : (keyMatching.length > 0
             ? keyMatching
-            : state.records.filter(r => r.direction === direction));
+            : myRecs.filter(r => r.direction === direction));
 
         if (fallbackMatching.length > 0) {
           const avgDelta = fallbackMatching.reduce((acc, item) => acc + (item.delta || 10), 0) / fallbackMatching.length;
           score += (avgDelta - 10) * 1.5;
         }
 
-        const recentSameDir = state.records.slice(-3).filter(r => r.direction === direction).length;
+        const recentSameDir = myRecs.slice(-3).filter(r => r.direction === direction).length;
         score -= recentSameDir * 4;
 
         if (direction === "center") {
@@ -535,7 +651,7 @@
           } else {
             score += ctxInfo.floor >= 45 ? 6 : 2;
           }
-          if (state.grade === "legend" && state.remainingTurns <= 2) {
+          if (state.grade === "legend" && ctxInfo.remainingAtTurn <= 2) {
             score += 4;
           }
         }
@@ -546,17 +662,17 @@
       function buildReasonText(bestDir, ctxInfo) {
         const keyName = KEY_LABELS[state.keyType] || "지옥 열쇠";
         const gradeName = GRADE_LABELS[state.grade] || "영웅";
-        const sameComboCount = state.records.filter(
+        const sameComboCount = getMyRecords().filter(
           r => r.keyType === state.keyType && r.grade === state.grade
         ).length;
 
         if (bestDir === "center") {
-          return `${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층 구간에서 변수를 노릴 만한 타이밍이라 '가운데'를 골랐어요 (기록 ${sameComboCount}건 반영).`;
+          return `[${state.userId}] ${keyName} · ${gradeName} · 추정 ${ctxInfo.floor}층 변수를 노릴 타이밍이라 '가운데'를 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
         }
         if (bestDir === "right") {
-          return `${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층 기준 더 깊은 층수 및 생존 조건을 고려해 '오른쪽'을 골랐어요 (기록 ${sameComboCount}건 반영).`;
+          return `[${state.userId}] ${keyName} · ${gradeName} · 추정 ${ctxInfo.floor}층 기준 더 깊은 층수와 생존 조건을 고려해 '오른쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
         }
-        return `${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층 흐름과 열쇠 조건을 따져 안정적인 '왼쪽'을 골랐어요 (기록 ${sameComboCount}건 반영).`;
+        return `[${state.userId}] ${keyName} · ${gradeName} · 추정 ${ctxInfo.floor}층 흐름과 열쇠 조건을 따져 안정적인 '왼쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
       }
 
       function pickCheerText(bestDir) {
@@ -567,40 +683,32 @@
       function appendAutoRecord(direction, ctxInfo) {
         const prevFloor = state.lastFloor ?? 0;
         const delta = Math.max(1, ctxInfo.floor - prevFloor);
-        const recordedRemainingTurns = state.remainingTurns;
 
-        state.records.push({
+        const newRecord = {
+          userId: state.userId,
           ts: Date.now(),
           floor: ctxInfo.floor,
           delta,
           direction,
           keyType: state.keyType,
           grade: state.grade,
-          remainingTurns: recordedRemainingTurns,
+          remainingTurns: ctxInfo.remainingAtTurn,
           gamble: ctxInfo.hasGambleAlert
-        });
+        };
+        state.records.push(newRecord);
+        pushRecordToExternalDb(newRecord);
 
-        if (state.records.length > 400) {
+        if (state.records.length > 600) {
           state.records.shift();
         }
 
         state.lastFloor = ctxInfo.floor;
         state.lastTurn += 1;
-        if (state.remainingTurns > 0) {
-          state.remainingTurns -= 1;
-        }
+        state.remainingTurns = Math.max(0, ctxInfo.remainingAtTurn - 1);
         saveRecords();
       }
 
-      function renderRecommendation(ctxInfo) {
-        const scores = {
-          left: scoreDirection("left", ctxInfo),
-          center: scoreDirection("center", ctxInfo),
-          right: scoreDirection("right", ctxInfo)
-        };
-
-        const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
-
+      function renderRecommendation(ctxInfo, scores, bestDir) {
         ["left", "center", "right"].forEach(dir => {
           const card = el.cards[dir];
           if (!card) return;
@@ -628,7 +736,7 @@
         if (el.cheerText) {
           el.cheerText.textContent = pickCheerText(bestDir);
         }
-        el.stateSummary.textContent = `${keyName} · ${gradeName} · 남은 ${state.remainingTurns}회 · ${state.lastTurn}회차`;
+        el.stateSummary.textContent = `${keyName} · ${gradeName} · 남은 ${ctxInfo.remainingAtTurn}회 · ${state.lastTurn}회차`;
       }
 
       function captureTick() {
@@ -641,9 +749,7 @@
         const ctx = el.canvas.getContext("2d");
         ctx.drawImage(el.video, 0, 0, w, h);
 
-        const sig = computeFrameSignature(ctx, w, h);
-        if (sig === state.lastFrameSignature) return;
-        state.lastFrameSignature = sig;
+        if (!hasMeaningfulSceneChange(ctx, w, h)) return;
 
         const ctxInfo = detectGameContext(ctx, w, h);
         const scores = {
@@ -654,7 +760,7 @@
         const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
 
         appendAutoRecord(bestDir, ctxInfo);
-        renderRecommendation(ctxInfo);
+        renderRecommendation(ctxInfo, scores, bestDir);
       }
 
       async function startShare() {
@@ -749,13 +855,15 @@
 
       if (el.resetRecordsBtn) {
         el.resetRecordsBtn.addEventListener("click", () => {
-          state.records = [];
+          state.records = state.records.filter(r => r.userId !== state.userId);
           state.lastFloor = null;
           state.lastTurn = 0;
+          state.lastSamplePixels = null;
+          state.remainingTurns = 3;
           saveRecords();
           if (el.floorDisplay) el.floorDisplay.textContent = "-층";
-          if (el.recHeadline) el.recHeadline.textContent = "기록이 초기화되었습니다";
-          if (el.recDetail) el.recDetail.textContent = "다시 공유를 시작하면 새 기록이 쌓입니다.";
+          if (el.recHeadline) el.recHeadline.textContent = "내 기록이 초기화되었습니다";
+          if (el.recDetail) el.recDetail.textContent = "다시 공유를 시작하면 내 ID로 새 기록이 쌓입니다.";
           if (el.cheerText) el.cheerText.textContent = "새 기록으로 다시 대박 층수 도전해 봅시다!";
         });
       }
