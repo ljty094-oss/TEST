@@ -363,7 +363,7 @@
       // 가운데 선택지가 나오면 가운데를 추천해 데이터를 모으고, 그 뒤로는 데이터 기준 최선만 추천
       const CENTER_DATA_SD = 0.07;
 
-      const APP_VERSION = "ver.15";
+      const APP_VERSION = "ver.16";
       const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
 
       const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽" };
@@ -1021,7 +1021,7 @@
         } else if (!state.ocrReady) {
           el.stateSummary.textContent = "HUD 인식 준비 중…";
         } else {
-          el.stateSummary.textContent = `HUD 자동 인식 중 · 수집 데이터 ${allRecords().length}건 반영`;
+          el.stateSummary.textContent = "HUD 자동 인식 중";
         }
       }
 
