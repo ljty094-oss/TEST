@@ -304,9 +304,10 @@
       // 이전 버전(v11)이 저장한 기록은 실제 층 이동이 아니어서 통계에서 제외합니다. (2026-11-22 00:00 KST 이후만 사용)
       const DATA_SINCE = "2026-11-21T15:00:00Z";
 
-      const OCR_INTERVAL_MS = 1000;   // HUD 판독 주기
-      const STABLE_READS = 3;         // 같은 값이 3번 읽혀야 확정 (강하 연출 중 오인식 방지)
-      const HUD_SAME_PIXELS = 40;     // HUD 영역에서 바뀐 픽셀이 이보다 적으면 OCR 생략 (숫자 한 글자 변화는 수백 픽셀)
+      const OCR_INTERVAL_MS = 500;    // HUD 판독 주기
+      const STABLE_READS = 2;         // 같은 값이 연속 2번 읽혀야 확정 (강하 연출 중 오인식 방지)
+      const HUD_SAME_PIXELS = 25;     // 글자 줄에서 바뀐 픽셀이 이보다 적으면 OCR 생략 (숫자 한 글자 변화는 수십~수백 픽셀)
+      const DEPARTURE_GAP_MS = 2500;  // 층 도착 후 이 시간이 지나 남은 횟수가 줄면 '강하 시작'으로 판단
       const REMOTE_REFRESH_MS = 60000;
       const REMOTE_PAGE_SIZE = 1000;
       const REMOTE_MAX_PAGES = 10;
@@ -337,6 +338,9 @@
       const SIDE_SD = Math.sqrt((20 * 20 - 1) / 12);
       const SIDE_PRIOR_N = 40;
       const SIDE_DIFF_Z = 2.5; // 수집 데이터에서 이 이상 차이가 나야 한쪽이 더 유리하다고 판단
+      // 가운데 데이터가 쌓일 때까지(대강하 비율 추정 오차가 이보다 클 때, 가운데 결과 약 50~60건)는
+      // 가운데 선택지가 나오면 가운데를 추천해 데이터를 모으고, 그 뒤로는 데이터 기준 최선만 추천
+      const CENTER_DATA_SD = 0.07;
 
       const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽" };
 
@@ -391,11 +395,17 @@
         ocrWorker: null,
         ocrReady: false,
         ocrFailed: false,
+        ocrLoading: null,
         read: {
           floor: { value: null, hits: 0 },
           turns: { value: null, hits: 0 }
         },
         lastHudBits: null,
+        watchBoxes: null,      // 직전 판독에서 층수·남은 횟수 글자가 있던 위치 (이 부분만 비교)
+        arrivedAt: 0,          // 현재 층을 확정한 시각
+        departureLocked: false,// 강하 시작이 감지되어 출발 당시 추천을 고정했는지
+        departureRec: null,    // 기록에 남길 '출발 당시 추천'
+        lastMove: null,        // 직전 강하 { from, to, direction } (안내 문구용)
         lastParsed: null,
         abyssHits: 0,
         abyss: false,          // HUD에 '나락'/'부활'이 보이면 나락으로 판단 (가운데 추천 안 함)
@@ -779,6 +789,17 @@
       /* ==============================================================
        * 6. 추천
        * ============================================================== */
+      // 직전 강하 안내: 화면만으로는 실제로 들어간 입구를 알 수 없어 '출발할 때의 추천'을 표시
+      // (상승은 가운데에서만 나오므로 '가운데 선택'으로 표시)
+      function moveText() {
+        const mv = state.lastMove;
+        if (!mv || mv.to !== state.floor) return "";
+        if (mv.to < mv.from) {
+          return `가운데 선택 → ${floorText(mv.from)}에서 ${floorText(mv.to)}으로 ${mv.from - mv.to}층 올라갔습니다.`;
+        }
+        return `직전 추천 '${LABEL[mv.direction]}' → ${floorText(mv.from)}에서 ${floorText(mv.to)}으로 ${mv.to - mv.from}층 내려왔습니다.`;
+      }
+
       function refreshRecommendation(arrivedNewFloor) {
         const f = state.floor;
         const r = state.turns;
@@ -793,9 +814,18 @@
           return;
         }
 
+        if (r === 0 && f < MAX_FLOOR && state.departureLocked) {
+          // 마지막 강하를 시작해 아직 도착 전 (도착하면 최종 결과 표시)
+          rec.headline = "마지막 강하 중입니다";
+          rec.cheer = "끝까지 깊게 내려가 봅시다!";
+          state.rec = rec;
+          render();
+          return;
+        }
+
         if (f >= MAX_FLOOR || r === 0) {
           rec.headline = f >= MAX_FLOOR ? "100층 도달! 강하 완료" : "강하 횟수를 모두 사용했습니다";
-          rec.detail = `최종 ${floorText(f)} · 보상 ${stageOf(f)}단계. 다음 열쇠로 입장하면 자동으로 다시 추천합니다.`;
+          rec.detail = [moveText(), `최종 ${floorText(f)} · 보상 ${stageOf(f)}단계. 다음 열쇠로 입장하면 자동으로 다시 추천합니다.`].filter(Boolean).join(" ");
           rec.cheer = "수고하셨습니다! 다음 열쇠도 대박 층수 노려봅시다!";
           state.rec = rec;
           render();
@@ -815,15 +845,23 @@
         rec.centerAvailable = isGamblePoint(f) && !state.abyss;
 
         if (rec.centerAvailable) {
-          // 가운데: 수집 데이터로 추정한 대강하 비율 기준, 남은 강하 동안의 기대 보상이 더 크면 추천
           const grand = estimateGrandRate(data);
-          const q = makeSolver(grand.mean).Q(f, turnsForCalc);
-          if (q.center > q.side) rec.direction = "center";
+          if (grand.sd > CENTER_DATA_SD) {
+            // 가운데 데이터가 쌓일 때까지는 가운데 추천
+            rec.direction = "center";
+          } else {
+            // 수집 데이터로 추정한 대강하 비율 기준, 남은 강하 동안의 기대 보상이 더 크면 추천
+            const q = makeSolver(grand.mean).Q(f, turnsForCalc);
+            if (q.center > q.side) rec.direction = "center";
+          }
         }
+
+        rec.detail = moveText();
 
         rec.headline = `지금은 '${LABEL[rec.direction]}' 추천`;
         rec.cheer = CHEER_MESSAGES[rec.direction][state.cheerIndex % 3];
         state.rec = rec;
+        if (!state.departureLocked) state.departureRec = rec;
         render();
       }
 
@@ -872,27 +910,34 @@
       /* ==============================================================
        * 8. HUD 판독 ('지하 N층', '강하 N회 가능')
        * ============================================================== */
-      async function initOcr() {
-        if (state.ocrReady || state.ocrWorker || !window.Tesseract) {
-          if (!window.Tesseract) {
-            state.ocrFailed = true;
-            render();
-          }
-          return;
-        }
-        try {
-          state.ocrWorker = await window.Tesseract.createWorker("kor", 1, { logger: () => {} });
-          await state.ocrWorker.setParameters({
-            tessedit_pageseg_mode: window.Tesseract.PSM.SPARSE_TEXT
-          });
-          state.ocrReady = true;
-          render();
-        } catch (err) {
-          console.warn("OCR 초기화 실패:", err);
-          state.ocrWorker = null;
+      // 인식 엔진 준비 (페이지를 열 때 미리 시작, 중복 실행 방지)
+      function initOcr() {
+        if (state.ocrReady) return Promise.resolve();
+        if (state.ocrLoading) return state.ocrLoading;
+        if (!window.Tesseract) {
           state.ocrFailed = true;
           render();
+          return Promise.resolve();
         }
+        state.ocrFailed = false;
+        state.ocrLoading = (async () => {
+          try {
+            const worker = await window.Tesseract.createWorker("kor", 1, { logger: () => {} });
+            await worker.setParameters({
+              tessedit_pageseg_mode: window.Tesseract.PSM.SPARSE_TEXT
+            });
+            state.ocrWorker = worker;
+            state.ocrReady = true;
+          } catch (err) {
+            console.warn("OCR 초기화 실패:", err);
+            state.ocrWorker = null;
+            state.ocrFailed = true;
+          } finally {
+            state.ocrLoading = null;
+            render();
+          }
+        })();
+        return state.ocrLoading;
       }
 
       function prepareHighContrastHudCrop() {
@@ -940,22 +985,30 @@
         return diff;
       }
 
+      // 숫자로 자주 잘못 읽히는 글자 보정
+      function toNumber(token) {
+        const t = token.replace(/[OoQD]/g, "0").replace(/[Il|\[\]!]/g, "1");
+        return /^\d+$/.test(t) ? parseInt(t, 10) : null;
+      }
+
       function parseHudText(rawText) {
         const text = (rawText || "").replace(/\s+/g, " ").trim();
+        const NUM = "([0-9OoQDIl|\\[\\]!]{1,3})";
         // 남은 강하: '강하 N회 가능' ('강'을 '감'으로, '회'를 '희'로 읽는 경우 등 허용)
-        const tm = text.match(/[강감]\s?[하허]\s*(\d{1,2})\s*[회희화외]/) || text.match(/(\d{1,2})\s*[회희화외]\s*[가기]\s?[능늠]/);
+        const tm = text.match(new RegExp("[강감]\\s?[하허]\\s*" + NUM + "\\s*[회희화외]")) ||
+          text.match(new RegExp(NUM + "\\s*[회희화외]\\s*[가기]\\s?[능늠]"));
         let turns = null;
         if (tm) {
-          const t = parseInt(tm[1], 10);
-          if (t >= 0 && t <= 12) turns = t;
+          const t = toNumber(tm[1]);
+          if (t !== null && t >= 0 && t <= 12) turns = t;
         }
         // 층수: '강하' 줄보다 위에 있는 제목에서만 읽음 ('층'을 '충'·'%' 등으로 읽는 경우 허용)
         const head = tm ? text.slice(0, tm.index) : text;
         let floor = null;
-        const fm = head.match(/지\s?[하허히]\s*(\d{1,3})\s*[층충총증%]/);
+        const fm = head.match(new RegExp("지\\s?[하허히]\\s*" + NUM + "\\s*[층충총증%]"));
         if (fm) {
-          const n = parseInt(fm[1], 10);
-          if (n >= 1 && n <= MAX_FLOOR) floor = n;
+          const n = toNumber(fm[1]);
+          if (n !== null && n >= 1 && n <= MAX_FLOOR) floor = n;
         } else if (/로\s?비/.test(head)) {
           floor = 0;
         }
@@ -980,59 +1033,100 @@
         state.sideChoice = null;
       }
 
-      // 층이 확정적으로 바뀌었을 때: 실제 가능한 이동이면 기록하고 다음 추천
+      // 층이 확정적으로 바뀌었을 때: 실제 가능한 이동이면 출발 당시 추천과 함께 기록하고 다음 추천
       function onFloorConfirmed(newFloor) {
         const prev = state.floor;
         if (prev === newFloor) return;
-        const rec = state.rec;
-        if (prev !== null && rec && rec.active && rec.floor === prev && isPossibleMove(prev, newFloor)) {
+        const dep = state.departureRec;
+        state.lastMove = null;
+        if (prev !== null && dep && dep.active && dep.floor === prev && isPossibleMove(prev, newFloor)) {
           appendMoveRecord({
             floorBefore: prev,
             floorAfter: newFloor,
-            direction: rec.direction,
-            remainingTurns: rec.turns,
+            direction: dep.direction,
+            remainingTurns: dep.turns,
             gamble: isGamblePoint(prev)
           });
+          state.lastMove = { from: prev, to: newFloor, direction: dep.direction };
         }
         if (newFloor === 0) resetForNewRun();
         state.floor = newFloor;
+        state.arrivedAt = Date.now();
+        state.departureLocked = false;
         refreshRecommendation(true);
       }
 
       function applyHudReading(parsed) {
         const floorC = stabilize("floor", parsed.floor);
         const turnsC = stabilize("turns", parsed.turns);
+        const floorChanged = floorC !== null && floorC !== state.floor;
+        let needRefresh = false;
+        let newRun = false;
 
         if (parsed.abyss) state.abyssHits++;
         if (!state.abyss && state.abyssHits >= STABLE_READS) {
           state.abyss = true;
-          if (state.rec && state.rec.active) refreshRecommendation(false);
+          needRefresh = true;
         }
 
-        let needRefresh = false;
         if (turnsC !== null && turnsC !== state.turns) {
           const prevTurns = state.turns;
           state.turns = turnsC;
           if (prevTurns !== null && turnsC >= prevTurns + 2) {
             // 남은 횟수가 크게 늘어남 = 새 열쇠로 입장 (로비)
             resetForNewRun();
-            if (floorC === null) {
-              state.floor = 0;
-              refreshRecommendation(true);
-            }
-          } else if (prevTurns === null || turnsC > prevTurns) {
-            needRefresh = true; // 처음 읽힘 또는 제단 효과로 횟수 증가
+            newRun = true;
+          } else if (!floorChanged && prevTurns !== null && turnsC < prevTurns &&
+                     Date.now() - state.arrivedAt > DEPARTURE_GAP_MS) {
+            // 층은 그대로인데 횟수만 줄어듦 = 강하를 시작함 → 출발 당시 추천을 기록용으로 고정
+            state.departureLocked = true;
           }
-          // 1회 감소는 강하 진행 중이므로 층이 확정될 때 함께 처리
+          needRefresh = true; // 0회가 되면 추천 종료, 늘거나 늦게 읽힌 경우 다시 계산
         }
 
-        if (floorC !== null && floorC !== state.floor) {
+        if (floorChanged) {
           onFloorConfirmed(floorC);
+        } else if (newRun) {
+          state.lastMove = null;
+          state.floor = 0;
+          state.arrivedAt = Date.now();
+          state.departureLocked = false;
+          refreshRecommendation(true);
         } else if (needRefresh) {
           refreshRecommendation(false);
         } else {
           render();
         }
+      }
+
+      // 직전 판독에서 층수·남은 횟수 글자가 있던 줄만 비교 (HUD 장식이 움직여도 불필요한 OCR을 하지 않음)
+      function hudChangedPixels(bits, width) {
+        const prev = state.lastHudBits;
+        if (!prev || prev.length !== bits.length) return Infinity;
+        if (!state.watchBoxes) return countBitDiff(bits, prev);
+        let diff = 0;
+        for (const b of state.watchBoxes) {
+          for (let y = b.y0; y < b.y1; y++) {
+            for (let x = b.x0; x < b.x1; x++) {
+              const i = y * width + x;
+              if (bits[i] !== prev[i]) diff++;
+            }
+          }
+        }
+        return diff;
+      }
+
+      function findWatchBoxes(data, width, height) {
+        const boxes = [];
+        (data.blocks || []).forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => {
+          if (!/층|충|총|증|%|로\s?비|회|희|가\s?능|지\s?옥|나\s?락|부\s?활/.test(l.text || "")) return;
+          const m = 8;
+          boxes.push({
+            x0: Math.max(0, l.bbox.x0 - m), y0: Math.max(0, l.bbox.y0 - m),
+            x1: Math.min(width, l.bbox.x1 + m), y1: Math.min(height, l.bbox.y1 + m)
+          });
+        })));
+        return boxes.length ? boxes : null;
       }
 
       async function captureTick() {
@@ -1041,14 +1135,16 @@
         state.isBusy = true;
         try {
           const crop = prepareHighContrastHudCrop();
+          const width = crop.canvas.width;
           let parsed;
-          if (state.lastParsed && countBitDiff(crop.bits, state.lastHudBits) < HUD_SAME_PIXELS) {
-            parsed = state.lastParsed; // HUD 변화 없음 → 직전 판독 결과 재사용
+          if (state.lastParsed && hudChangedPixels(crop.bits, width) < HUD_SAME_PIXELS) {
+            parsed = state.lastParsed; // 글자 변화 없음 → 직전 판독 결과 재사용
           } else {
-            const { data } = await state.ocrWorker.recognize(crop.canvas);
+            const { data } = await state.ocrWorker.recognize(crop.canvas, {}, { text: true, blocks: true });
             parsed = parseHudText(data && data.text ? data.text : "");
             state.lastParsed = parsed;
             state.lastHudBits = crop.bits;
+            state.watchBoxes = findWatchBoxes(data || {}, width, crop.canvas.height);
           }
           applyHudReading(parsed);
         } catch (err) {
@@ -1073,7 +1169,7 @@
 
         try {
           const stream = await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: { ideal: 5, max: 15 } },
+            video: { frameRate: { ideal: 10, max: 15 } },
             audio: false
           });
 
@@ -1116,6 +1212,7 @@
         state.read.turns = { value: null, hits: 0 };
         state.lastParsed = null;
         state.lastHudBits = null;
+        state.watchBoxes = null;
 
         el.liveDot.classList.remove("live");
         if (!keepErrorDot) el.liveDot.classList.remove("error");
@@ -1130,6 +1227,7 @@
       });
 
       refreshRecommendation(false);
+      initOcr();
       fetchRemoteRecords();
       state.remoteTimerId = setInterval(fetchRemoteRecords, REMOTE_REFRESH_MS);
     })();
