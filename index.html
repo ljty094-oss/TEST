@@ -149,12 +149,6 @@
       background: #3b7af5;
     }
 
-    button.danger {
-      background: transparent;
-      color: var(--muted);
-      padding: 8px 12px;
-      font-size: 12px;
-    }
 
     .direction-grid {
       display: grid;
@@ -223,6 +217,10 @@
       line-height: 1.45;
     }
 
+    .rec-detail:empty {
+      display: none;
+    }
+
     .cheer-line {
       font-size: 13px;
       color: #a7c7ff;
@@ -230,51 +228,10 @@
       margin-top: 2px;
     }
 
-    .footer-bar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 12px;
-      color: var(--muted);
-      padding: 0 4px;
-      gap: 8px;
-    }
 
-    .hud-debug-box {
-      background: #10141e;
-      border: 1px dashed #2d374e;
-      border-radius: 12px;
-      padding: 10px 12px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      font-size: 12px;
-      color: var(--muted);
-    }
 
-    .hud-debug-info {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      min-width: 0;
-    }
 
-    .hud-ocr-raw {
-      color: #c5d6f5;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
 
-    #hudPreviewCanvas {
-      width: 120px;
-      height: 72px;
-      border-radius: 6px;
-      border: 1px solid #2b344b;
-      background: #07090e;
-      flex-shrink: 0;
-    }
 
     .hidden-capture {
       display: none;
@@ -332,23 +289,10 @@
 
     <div class="summary-card">
       <div id="recHeadline" class="rec-headline">공유를 시작하면 자동으로 추천합니다</div>
-      <div id="recDetail" class="rec-detail">좌측 상단 '지하 N층' 및 '강하 N회 가능' HUD를 자동으로 읽어 방향을 추천합니다.</div>
+      <div id="recDetail" class="rec-detail"></div>
       <div id="cheerText" class="cheer-line">오늘도 대박 층수 노려봅시다!</div>
     </div>
 
-    <div class="hud-debug-box">
-      <div class="hud-debug-info">
-        <span id="hudReadStatus">HUD 인식: 대기 중</span>
-        <span id="hudOcrText" class="hud-ocr-raw">읽힌 글자: 없음</span>
-        <span id="dbStatus" class="hud-ocr-raw">데이터 서버: 확인 전</span>
-      </div>
-      <canvas id="hudPreviewCanvas" width="120" height="72"></canvas>
-    </div>
-
-    <div class="footer-bar">
-      <span id="recordCountText">내 기록: 0건 (ID: -)</span>
-      <button id="resetRecordsBtn" class="danger" type="button">내 기록 초기화</button>
-    </div>
   </div>
 
   <video id="hiddenVideo" class="offscreen-video" autoplay muted playsinline></video>
@@ -364,7 +308,7 @@
       const STORAGE_KEY = "hell_descent_records_v2"; // v2: 실제 층 이동만 기록 (v1 기록은 사용 안 함)
       const USER_ID_KEY = "hell_descent_user_id_v1";
       const EXTERNAL_DB_CONFIG = {
-        supabaseUrl: "https://ggbsbxppkpewultsmiz.supabase.co",
+        supabaseUrl: "https://ggbsbxsppkpewultsmiz.supabase.co",
         supabaseAnonKey: "sb_publishable_XGuZI--CLpwE5UliON-8Ew_Qx2GhSkM",
         supabaseTable: "hell_descent_records",
         customPostUrl: ""
@@ -489,17 +433,11 @@
         floorDisplay: document.getElementById("floorDisplay"),
         turnsDisplay: document.getElementById("turnsDisplay"),
         toggleShareBtn: document.getElementById("toggleShareBtn"),
-        resetRecordsBtn: document.getElementById("resetRecordsBtn"),
-        recordCountText: document.getElementById("recordCountText"),
         recHeadline: document.getElementById("recHeadline"),
         recDetail: document.getElementById("recDetail"),
         cheerText: document.getElementById("cheerText"),
         video: document.getElementById("hiddenVideo"),
         hudCanvas: document.getElementById("hudCanvas"),
-        hudPreviewCanvas: document.getElementById("hudPreviewCanvas"),
-        hudReadStatus: document.getElementById("hudReadStatus"),
-        hudOcrText: document.getElementById("hudOcrText"),
-        dbStatus: document.getElementById("dbStatus"),
         cards: {
           left: document.getElementById("card-left"),
           center: document.getElementById("card-center"),
@@ -561,15 +499,6 @@
         } catch (e) {
           console.warn("localStorage 저장 실패:", e);
         }
-        updateRecordCounter();
-      }
-
-      function getMyRecords() {
-        return state.records.filter(r => r.userId === state.userId);
-      }
-
-      function updateRecordCounter() {
-        el.recordCountText.textContent = `내 기록: ${getMyRecords().length}건 (ID: ${state.userId})`;
       }
 
       function isSupabaseConfigured() {
@@ -902,7 +831,7 @@
 
         if (f === null) {
           rec.headline = state.stream ? "HUD에서 현재 층수를 읽는 중입니다" : "공유를 시작하면 자동으로 추천합니다";
-          rec.detail = "좌측 상단 '지하 N층' 및 '강하 N회 가능' HUD를 자동으로 읽어 방향을 추천합니다.";
+          rec.detail = "";
           rec.cheer = "오늘도 대박 층수 노려봅시다!";
           state.rec = rec;
           render();
@@ -1007,19 +936,15 @@
         el.recDetail.textContent = rec.detail;
         el.cheerText.textContent = rec.cheer;
 
-        el.stateSummary.textContent = state.stream
-          ? `HUD 자동 인식 중 · 수집 데이터 ${allRecords().length}건 반영`
-          : "좌측 상단 HUD 자동 인식 대기";
-
-        const rf = state.read.floor;
-        const checking = rf.value !== null && rf.value !== state.floor && rf.hits < STABLE_READS
-          ? ` · 확인 중 ${floorText(rf.value)} (${rf.hits}/${STABLE_READS})`
-          : "";
-        if (state.ocrReady) {
-          el.hudReadStatus.textContent = `HUD 인식: ${state.floor === null ? "-" : floorText(state.floor)} · 강하 ${state.turns === null ? "-" : state.turns}회${checking}`;
+        if (!state.stream) {
+          el.stateSummary.textContent = "좌측 상단 HUD 자동 인식 대기";
+        } else if (state.ocrFailed) {
+          el.stateSummary.textContent = "HUD 인식 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
+        } else if (!state.ocrReady) {
+          el.stateSummary.textContent = "HUD 인식 준비 중…";
+        } else {
+          el.stateSummary.textContent = `HUD 자동 인식 중 · 수집 데이터 ${allRecords().length}건 반영`;
         }
-        el.dbStatus.textContent = `데이터 서버: ${state.dbStatus}`;
-        updateRecordCounter();
       }
 
       function setErrorState(title, detail) {
@@ -1037,23 +962,22 @@
         if (state.ocrReady || state.ocrWorker || !window.Tesseract) {
           if (!window.Tesseract) {
             state.ocrFailed = true;
-            el.hudReadStatus.textContent = "HUD 인식: OCR 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
+            render();
           }
           return;
         }
         try {
-          el.hudReadStatus.textContent = "HUD 인식: OCR 엔진 불러오는 중…";
           state.ocrWorker = await window.Tesseract.createWorker("kor+eng", 1, { logger: () => {} });
           await state.ocrWorker.setParameters({
             tessedit_pageseg_mode: window.Tesseract.PSM.SPARSE_TEXT
           });
           state.ocrReady = true;
-          el.hudReadStatus.textContent = "HUD 인식: 준비 완료";
+          render();
         } catch (err) {
           console.warn("OCR 초기화 실패:", err);
           state.ocrWorker = null;
           state.ocrFailed = true;
-          el.hudReadStatus.textContent = "HUD 인식: OCR 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
+          render();
         }
       }
 
@@ -1092,10 +1016,6 @@
           }
         }
         hctx.putImageData(imgData, 0, 0);
-
-        const pctx = el.hudPreviewCanvas.getContext("2d");
-        pctx.clearRect(0, 0, el.hudPreviewCanvas.width, el.hudPreviewCanvas.height);
-        pctx.drawImage(c, 0, 0, el.hudPreviewCanvas.width, el.hudPreviewCanvas.height);
         return { canvas: c, bits };
       }
 
@@ -1199,10 +1119,7 @@
 
       async function captureTick() {
         if (state.isBusy || !state.stream || !el.video || el.video.readyState < 2) return;
-        if (!state.ocrReady) {
-          if (state.ocrFailed) el.hudReadStatus.textContent = "HUD 인식: OCR 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
-          return;
-        }
+        if (!state.ocrReady) return;
         state.isBusy = true;
         try {
           const crop = prepareHighContrastHudCrop();
@@ -1215,7 +1132,6 @@
             state.lastParsed = parsed;
             state.lastHudBits = crop.bits;
           }
-          el.hudOcrText.textContent = `읽힌 글자: ${parsed.raw || "없음"}`;
           applyHudReading(parsed);
         } catch (err) {
           console.warn("HUD 판독 중 오류:", err);
@@ -1293,14 +1209,6 @@
       el.toggleShareBtn.addEventListener("click", () => {
         if (state.stream) stopShare(false);
         else startShare();
-      });
-
-      el.resetRecordsBtn.addEventListener("click", () => {
-        state.records = state.records.filter(r => r.userId !== state.userId);
-        saveRecords();
-        el.recHeadline.textContent = "내 기록이 초기화되었습니다";
-        el.recDetail.textContent = "이 기기에 저장된 내 기록만 지웠습니다. 서버에 모인 데이터는 그대로 반영됩니다.";
-        el.cheerText.textContent = "새 기록으로 다시 대박 층수 도전해 봅시다!";
       });
 
       refreshRecommendation(false);
