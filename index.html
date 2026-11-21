@@ -237,6 +237,67 @@
       margin-top: 2px;
     }
 
+    /* 나락 모드: 게임 화면처럼 보라색 테마로 전환 */
+    body.abyss {
+      --bg: #0d0a1c;
+      --card: #171330;
+      --border: #2e2650;
+      --accent: #9a6bff;
+    }
+
+    body.abyss .floor-badge {
+      background: #1d1838;
+      border-color: #3a2f66;
+    }
+
+    body.abyss .floor-badge .value {
+      color: #c7a6ff;
+    }
+
+    body.abyss .dir-card.active {
+      background: linear-gradient(180deg, rgba(154, 107, 255, 0.24), var(--card));
+    }
+
+    body.abyss button.primary:hover {
+      background: #8a5af0;
+    }
+
+    body.abyss .cheer-line {
+      color: #cdb6ff;
+    }
+
+    .dir-card.active.stop,
+    body.abyss .dir-card.active.stop {
+      border-color: #ff7a59;
+      background: linear-gradient(180deg, rgba(255, 122, 89, 0.24), var(--card));
+    }
+
+    .revive-badge {
+      display: none;
+    }
+
+    body.abyss .revive-badge {
+      display: block;
+    }
+
+    .mode-line {
+      color: #c7a6ff;
+      font-weight: 700;
+    }
+
+    .summary-card.death {
+      border-color: #ff7a59;
+      box-shadow: 0 0 14px rgba(255, 122, 89, 0.22);
+    }
+
+    .death-line {
+      color: #ff9a85;
+    }
+
+    .survive-line {
+      color: #8fe3b0;
+    }
+
 
 
 
@@ -277,6 +338,10 @@
           <span class="label">남은 강하</span>
           <span id="turnsDisplay" class="value">-회</span>
         </div>
+        <div class="floor-badge revive-badge">
+          <span class="label">부활</span>
+          <span id="reviveDisplay" class="value">-회</span>
+        </div>
         <button id="toggleShareBtn" class="primary" type="button">화면 공유 시작</button>
       </div>
     </div>
@@ -286,7 +351,7 @@
         <div class="dir-name">왼쪽</div>
       </div>
       <div id="card-center" class="dir-card">
-        <div class="dir-name">가운데</div>
+        <div id="centerName" class="dir-name">가운데</div>
       </div>
       <div id="card-right" class="dir-card">
         <div class="dir-name">오른쪽</div>
@@ -363,10 +428,22 @@
       // 가운데 선택지가 나오면 가운데를 추천해 데이터를 모으고, 그 뒤로는 데이터 기준 최선만 추천
       const CENTER_DATA_SD = 0.07;
 
-      const APP_VERSION = "ver.16";
+      /* 나락 — 로스트아크 공식 11/12 업데이트 공지, 게임 가이드 '낙원'
+       * - 화염 열쇠: 짝수 층 생존·홀수 층 사망 / 서리 열쇠: 홀수 층 생존·짝수 층 사망 (서리라도 100층은 생존)
+       * - 기본 부활 1회, 부활 횟수를 다 쓴 상태에서 사망하면 보상 기회 소멸
+       * - '중단하고 보상 받기'를 누르면 현재 층 보상을 받고 종료, 보상은 10층 단위로 강화
+       * - 가운데(대강하/상승) 없음 → 왼쪽/오른쪽 1~20층, 보상 구조는 같은 레벨 지옥과 같아 단계별 가치는 지옥 기준 사용
+       * - 11층 단위 특수층(생존 층에만 등장): 상자+1, 강하+1, 최소 16층(로켓 점프), 생명+1 */
+      const ABYSS_DEFAULT_REVIVES = 1;
+      const LEAP_MIN = 16, LEAP_MAX = 20;  // '최소 16층' 효과: 다음 강하 16~20층
+      const ABYSS_SIDE_OCR_MS = 1500;      // 부활 횟수·홀짝 안내 문구를 다시 읽는 간격
+      const DEATH_HUD_GRACE_MS = 10000;    // 사망 층 도착 뒤 HUD의 부활 횟수가 늦게 바뀌는 동안은 이전 값 무시
+
+      const APP_VERSION = "ver.18";
       const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
 
-      const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽" };
+      const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽", stop: "중단하고 보상 받기" };
+      const PARITY_NAME = ["짝수", "홀수"];
 
       // 직전 강하 결과에 따라 사람처럼 반응하는 멘트 ({d} 내려온 층수, {n} 올라간 층수, {remain} 남은 횟수 안내, {dirRo} 추천 방향)
       const DIR_RO = { left: "왼쪽으로", center: "가운데로", right: "오른쪽으로" };
@@ -423,6 +500,57 @@
         if (f >= 50) return `${f}층에서 마무리됐어요. 무난한 판이었어요, 수고하셨습니다!`;
         if (f >= 30) return `${f}층에서 끝났네요… 조금 아쉬운 판이었어요. 다음 열쇠는 더 깊이 가 봅시다!`;
         return `${f}층에서 끝나 버렸네요… 이번 판은 많이 아쉬워요. 다음 열쇠로 꼭 만회해 봅시다!`;
+      }
+
+      // 나락 멘트 ({d} 내려온 층수, {f} 도착 층, {dirRo} 추천 방향, {par} 사망한 층 종류)
+      const ABYSS_CHEERS = {
+        lobby: [
+          "나락 입장! 부활 기회가 있으니 첫 강하는 과감하게 가 봅시다!",
+          "나락 도전 시작! 운을 믿고 {dirRo} 내려가 봅시다!"
+        ],
+        surviveTiny: [
+          "{d}층밖에 못 내려왔지만 일단 살았어요! {dirRo} 다시 가 봅시다.",
+          "아쉽게 {d}층이지만 생존은 했어요. {dirRo} 한 번 더 가 봅시다!"
+        ],
+        surviveGo: [
+          "{d}층 내려와서 생존! 이 기세로 {dirRo} 한 번 더 가 봅시다!",
+          "살았어요! {f}층 안착, {dirRo} 계속 가 봅시다!"
+        ],
+        surviveGreat: [
+          "{d}층 대박 강하에 생존까지! {dirRo} 쭉 가 봅시다!"
+        ],
+        surviveStop: [
+          "{f}층 생존! 여기서 보상 챙기는 게 이득이에요.",
+          "무사히 {f}층 도착! 욕심내지 말고 여기서 보상 받아 갑시다."
+        ],
+        revivedStop: [
+          "아… {par} 층에 걸려 부활을 써 버렸어요. 그래도 {f}층 보상은 지켰으니 여기서 멈추는 게 좋아요.",
+          "부활을 쓰긴 했지만 {f}층까지 내려왔어요. 아쉽지만 여기서 보상 챙겨 갑시다."
+        ],
+        revivedGo: [
+          "{par} 층에 걸려 부활을 썼어요… 그래도 아직 해볼 만해요. {dirRo} 가 봅시다!"
+        ],
+        stop: [
+          "지금 멈추는 게 이득이에요. {f}층 보상 챙겨 갑시다!"
+        ],
+        go: [
+          "{dirRo} 내려가 봅시다! 생존을 빌어요!",
+          "좋아요, {dirRo} 가 봅시다! 이번에도 살아남아 봅시다!"
+        ]
+      };
+
+      function fillAbyssCheer(list, vars) {
+        return list[state.cheerIndex % list.length]
+          .replace("{d}", vars.d).replace("{f}", vars.f).replace("{par}", vars.par).replace("{dirRo}", vars.dirRo);
+      }
+
+      // 나락이 끝났을 때 (보상을 받고 끝난 경우)
+      function abyssFinishCheer(f) {
+        if (f >= MAX_FLOOR) return "나락 100층 도달! 정말 대단한 판이었어요. 수고하셨습니다!";
+        if (f >= 70) return `나락 ${f}층에서 보상 획득! 이 정도면 대박이에요. 수고하셨습니다!`;
+        if (f >= 40) return `나락 ${f}층 보상 획득! 무사히 잘 챙겨 나왔어요. 수고하셨습니다!`;
+        if (f >= 20) return `${f}층에서 보상 챙겼어요. 무리하지 않은 좋은 선택이었어요!`;
+        return `${f}층에서 마무리됐네요… 조금 아쉽지만 보상은 지켰어요. 다음 열쇠로 더 깊이 가 봅시다!`;
       }
 
       const CHEER_MESSAGES = {
@@ -493,11 +621,22 @@
         altarFloor: null,      // 제단 효과를 확인 중인 층 (11층 단위)
         altarUntil: 0,         // 제단 안내 문구를 읽을 시한
         altarEffect: null,     // 확인된 제단 효과 { name, desc }
+        altarDepTurns: null,   // 제단 층으로 출발할 때의 남은 강하 ('강하+1' 확인용)
+        altarTurnsChecked: false,
         runDeltas: [],         // 이번 판의 강하 층수 기록 (연속 강하 보너스 확인용)
         endedHits: 0,
         lastParsed: null,
         abyssHits: 0,
-        abyss: false,          // HUD에 '나락'/'부활'이 보이면 나락으로 판단 (가운데 추천 안 함)
+        abyss: false,          // HUD에 '나락'/'부활 횟수'가 보이면 나락으로 판단
+        abyssSafe: null,       // 나락 생존 층: 1 = 홀수(서리 열쇠), 0 = 짝수(화염 열쇠), null = 아직 모름
+        parityRead: { value: null, hits: 0 },
+        revives: null,         // 나락 남은 부활 횟수
+        reviveRead: { value: null, hits: 0 },
+        lastSideOcrAt: 0,      // 부활 횟수·홀짝 안내를 마지막으로 읽은 시각
+        revivesAtArrival: null,// 현재 층에 도착했을 때의 부활 횟수 (사망 여부 확인용)
+        deadlyArrivalAt: 0,    // 사망 층에 도착한 시각
+        abyssDeath: null,      // 직전 사망 { floor, revived }
+        abyssFailed: false,    // 부활 없이 사망 → 보상 기회 소멸
         floor: null,           // 확정된 현재 층 (0 = 로비)
         turns: null,           // 확정된 남은 강하 횟수
         sideChoice: null,      // 이번 층에서 고른 왼쪽/오른쪽 (층이 바뀔 때만 새로 고름)
@@ -515,6 +654,8 @@
         stateSummary: document.getElementById("stateSummary"),
         floorDisplay: document.getElementById("floorDisplay"),
         turnsDisplay: document.getElementById("turnsDisplay"),
+        reviveDisplay: document.getElementById("reviveDisplay"),
+        centerName: document.getElementById("centerName"),
         toggleShareBtn: document.getElementById("toggleShareBtn"),
         recHeadline: document.getElementById("recHeadline"),
         recDetail: document.getElementById("recDetail"),
@@ -876,6 +1017,53 @@
         return { V, Q };
       }
 
+      /* 나락: 계속 강하 vs '중단하고 보상 받기' 계산
+       * 강하하면 1~20층 무작위('최소 16층' 효과면 16~20층), 도착 층이 사망 층이면 부활 1회 소모 후 그 층에서 계속,
+       * 부활이 없으면 보상 0. 100층은 항상 생존. 남은 강하 동안 기대 보상이 가장 큰 쪽을 고름 */
+      const abyssMemo = [new Map(), new Map()];
+      const stageValue = f => STAGE_VALUE[stageOf(f)];
+      function abyssV(f, r, k, par) {
+        if (f >= MAX_FLOOR || r <= 0) return stageValue(f);
+        const key = (f * 16 + Math.min(r, 15)) * 4 + Math.min(k, 3);
+        const memo = abyssMemo[par];
+        const hit = memo.get(key);
+        if (hit !== undefined) return hit;
+        const v = Math.max(stageValue(f), abyssGo(f, r, k, par, SIDE_MIN, SIDE_MAX));
+        memo.set(key, v);
+        return v;
+      }
+      function abyssGo(f, r, k, par, dMin, dMax) {
+        let sum = 0;
+        for (let d = dMin; d <= dMax; d++) {
+          const x = capTop(f + d);
+          if (x >= MAX_FLOOR || x % 2 === par) sum += abyssV(x, r - 1, k, par);
+          else if (k > 0) sum += abyssV(x, r - 1, k - 1, par);
+        }
+        return sum / (dMax - dMin + 1);
+      }
+      function abyssSurvival(f, par, dMin, dMax) {
+        let safe = 0;
+        for (let d = dMin; d <= dMax; d++) {
+          const x = capTop(f + d);
+          if (x >= MAX_FLOOR || x % 2 === par) safe++;
+        }
+        return safe / (dMax - dMin + 1);
+      }
+      // par: 1 = 홀수 생존, 0 = 짝수 생존, null = 모름(두 경우 평균)
+      function abyssDecision(f, r, k, par, leap) {
+        const dMin = leap ? LEAP_MIN : SIDE_MIN;
+        const dMax = leap ? LEAP_MAX : SIDE_MAX;
+        const kk = Math.min(Math.max(k, 0), 3);
+        const pars = par === null ? [0, 1] : [par];
+        let go = 0, surv = 0;
+        pars.forEach(p => {
+          go += abyssGo(f, r, kk, p, dMin, dMax) / pars.length;
+          surv += abyssSurvival(f, p, dMin, dMax) / pars.length;
+        });
+        const stop = stageValue(f);
+        return { go, stop, surv, continueBetter: go > stop };
+      }
+
       /* ==============================================================
        * 6. 추천
        * ============================================================== */
@@ -887,18 +1075,103 @@
         if (mv.to < mv.from) {
           return `가운데 선택 → ${floorText(mv.from)}에서 ${floorText(mv.to)}으로 ${mv.from - mv.to}층 올라갔습니다.`;
         }
+        if (mv.direction === "stop" || !LABEL[mv.direction]) {
+          // 나락에서 '중단' 추천과 달리 계속 내려간 경우
+          return `${floorText(mv.from)}에서 ${floorText(mv.to)}으로 ${mv.to - mv.from}층 내려왔습니다.`;
+        }
         return `직전 추천 '${LABEL[mv.direction]}' → ${floorText(mv.from)}에서 ${floorText(mv.to)}으로 ${mv.to - mv.from}층 내려왔습니다.`;
+      }
+
+      // 나락: 직전 강하 결과 (생존 / 사망 후 부활 / 사망으로 보상 소멸)
+      function abyssOutcome() {
+        const f = state.floor;
+        const mv = state.lastMove;
+        if (!f) return null;
+        const death = state.abyssDeath && state.abyssDeath.floor === f ? state.abyssDeath : null;
+        if (death) {
+          return death.revived
+            ? { kind: "revived", text: `${PARITY_NAME[f % 2]} 층에 도착해 사망… 부활 1회를 사용했습니다.` }
+            : { kind: "failed", text: `${PARITY_NAME[f % 2]} 층에 도착해 사망… 부활이 없어 보상 기회가 사라졌습니다.` };
+        }
+        if (!mv || mv.to !== f) return null;
+        if (f >= MAX_FLOOR) return { kind: "survive", text: "100층은 사망하지 않습니다. 생존!" };
+        if (state.abyssSafe === null) return null;
+        return { kind: "survive", text: `${PARITY_NAME[f % 2]} 층이라 생존!` };
+      }
+
+      function abyssRecommendation(rec, arrivedNewFloor) {
+        const f = state.floor;
+        const r = state.turns;
+        const k = state.revives === null ? ABYSS_DEFAULT_REVIVES : state.revives;
+        const leap = Boolean(state.altarEffect === ALTAR.leap && state.altarFloor === f);
+        const dec = abyssDecision(f, r === null ? 3 : r, k, state.abyssSafe, leap);
+        if (arrivedNewFloor || !state.sideChoice) {
+          state.sideChoice = pickSide(analyzeSides(allRecords()));
+          state.cheerIndex = Math.floor(Math.random() * 3);
+        }
+        rec.active = true;
+        rec.direction = dec.continueBetter ? state.sideChoice : "stop";
+        rec.headline = `지금은 '${LABEL[rec.direction]}' 추천`;
+
+        const survPct = state.abyssSafe === null ? null : Math.round(dec.surv * 100);
+        let reason;
+        if (rec.direction === "stop") {
+          reason = k > 0
+            ? "지금 멈추는 쪽이 기대 보상이 더 큽니다."
+            : `부활을 모두 써서 다음 강하에서 사망하면 보상이 사라집니다${survPct !== null ? ` (생존 확률 ${survPct}%)` : ""}. 지금 멈추는 쪽이 유리합니다.`;
+        } else if (k > 0) {
+          reason = `부활 ${k}회가 남아 있어 사망해도 보상이 사라지지 않습니다. 계속 내려가는 쪽이 유리합니다.`;
+        } else {
+          const why = leap ? "'최소 16층' 효과로 크게 내려갈 수 있어" : "100층(사망 없음)에 가까워";
+          reason = `부활은 없지만 ${why} 계속 가는 쪽의 기대 보상이 더 큽니다${survPct !== null ? ` (생존 확률 ${survPct}%)` : ""}.`;
+        }
+
+        const out = abyssOutcome();
+        rec.parts = [
+          { text: moveText() },
+          out ? { text: out.text, cls: out.kind === "survive" ? "survive-line" : "death-line" } : null,
+          { text: reason }
+        ].filter(Boolean);
+        rec.tone = out && out.kind !== "survive" ? "death" : null;
+
+        const mv = state.lastMove;
+        const d = mv && mv.to === f ? mv.to - mv.from : 0;
+        const stop = rec.direction === "stop";
+        let list;
+        if (f === 0) list = ABYSS_CHEERS.lobby;
+        else if (out && out.kind === "revived") list = stop ? ABYSS_CHEERS.revivedStop : ABYSS_CHEERS.revivedGo;
+        else if (out && out.kind === "survive") {
+          list = stop ? ABYSS_CHEERS.surviveStop
+            : (d <= 4 ? ABYSS_CHEERS.surviveTiny : (d >= 15 ? ABYSS_CHEERS.surviveGreat : ABYSS_CHEERS.surviveGo));
+        } else list = stop ? ABYSS_CHEERS.stop : ABYSS_CHEERS.go;
+        rec.cheer = fillAbyssCheer(list, { d, f, par: PARITY_NAME[f % 2], dirRo: DIR_RO[rec.direction] || "" });
       }
 
       function refreshRecommendation(arrivedNewFloor) {
         const f = state.floor;
         const r = state.turns;
-        const rec = { active: false, direction: null, centerAvailable: false, floor: f, turns: r, headline: "", detail: "", cheer: "" };
+        const rec = { active: false, direction: null, centerAvailable: false, floor: f, turns: r, headline: "", detail: "", parts: null, tone: null, cheer: "" };
 
         if (f === null) {
           rec.headline = state.stream ? "HUD에서 현재 층수를 읽는 중입니다" : "공유를 시작하면 자동으로 추천합니다";
           rec.detail = "";
           rec.cheer = "오늘도 대박 층수 노려봅시다!";
+          state.rec = rec;
+          render();
+          return;
+        }
+
+        if (state.abyss && state.abyssFailed) {
+          // 나락: 부활 없이 사망 → 보상 기회 소멸
+          const out = abyssOutcome();
+          rec.headline = "사망 · 이번 나락은 보상 없이 종료되었습니다";
+          rec.parts = [
+            { text: moveText() },
+            out ? { text: out.text, cls: "death-line" } : null,
+            { text: "다음 열쇠로 입장하면 자동으로 다시 추천합니다." }
+          ].filter(Boolean);
+          rec.tone = "death";
+          rec.cheer = "부활 없이 사망해 보상이 사라졌어요… 정말 아쉬워요. 다음 열쇠로 꼭 만회해 봅시다!";
           state.rec = rec;
           render();
           return;
@@ -914,11 +1187,33 @@
         }
 
         if (state.ended || f >= MAX_FLOOR || r === 0) {
+          if (state.abyss) {
+            const out = abyssOutcome();
+            rec.headline = f >= MAX_FLOOR ? "100층 도달! 이번 나락이 종료되었습니다"
+              : (r === 0 ? "남은 강하 0회 · 이번 나락이 종료되었습니다" : `${floorText(f)} 보상 획득 · 이번 나락이 종료되었습니다`);
+            rec.parts = [
+              { text: moveText() },
+              out ? { text: out.text, cls: out.kind === "survive" ? "survive-line" : "death-line" } : null,
+              { text: `최종 ${floorText(f)} · 보상 ${stageOf(f)}단계. 다음 열쇠로 입장하면 자동으로 다시 추천합니다.` }
+            ].filter(Boolean);
+            rec.cheer = abyssFinishCheer(f);
+            state.rec = rec;
+            render();
+            return;
+          }
           rec.headline = f >= MAX_FLOOR ? "100층 도달! 이번 판이 종료되었습니다"
             : (r === 0 ? "남은 강하 0회 · 이번 판이 종료되었습니다" : "이번 판이 종료되었습니다");
           rec.detail = [moveText(), `최종 ${floorText(f)} · 보상 ${stageOf(f)}단계. 다음 열쇠로 입장하면 자동으로 다시 추천합니다.`].filter(Boolean).join(" ");
           rec.cheer = finishCheer(f);
           state.rec = rec;
+          render();
+          return;
+        }
+
+        if (state.abyss) {
+          abyssRecommendation(rec, arrivedNewFloor);
+          state.rec = rec;
+          if (!state.departureLocked) state.departureRec = rec;
           render();
           return;
         }
@@ -976,13 +1271,19 @@
 
         el.floorDisplay.textContent = state.floor === null ? "-층" : floorText(state.floor);
         el.turnsDisplay.textContent = state.turns === null ? "-회" : `${state.turns}회`;
+        el.reviveDisplay.textContent = state.revives === null ? "-회" : `${state.revives}회`;
+        // 나락이면 보라색 테마, 가운데 칸은 '중단'(중단하고 보상 받기)으로 사용
+        document.body.classList.toggle("abyss", Boolean(state.abyss));
+        el.centerName.textContent = state.abyss ? "중단" : "가운데";
 
+        const target = rec.direction === "stop" ? "center" : rec.direction;
         ["left", "center", "right"].forEach(dir => {
           const card = el.cards[dir];
-          card.classList.remove("active", "center-gamble");
-          if (rec.active && dir === rec.direction) {
+          card.classList.remove("active", "center-gamble", "stop");
+          if (rec.active && dir === target) {
             card.classList.add("active");
-            if (dir === "center") card.classList.add("center-gamble");
+            if (rec.direction === "stop") card.classList.add("stop");
+            else if (dir === "center") card.classList.add("center-gamble");
           }
         });
 
@@ -999,7 +1300,7 @@
         }
         const streak = streakInfo();
         const bonus = streak && streak.count >= 3;
-        if (bonus || (streak && streak.count === 2 && rec.active)) {
+        if (bonus || (streak && streak.count === 2 && rec.active && rec.direction !== "stop")) {
           const line = document.createElement("span");
           line.className = "streak-line";
           line.textContent = bonus
@@ -1008,18 +1309,32 @@
           el.recDetail.appendChild(line);
         }
         if (rec.detail) el.recDetail.appendChild(document.createTextNode(rec.detail));
-        el.summaryCard.classList.toggle("altar", Boolean(altar));
-        el.summaryCard.classList.toggle("streak", Boolean(bonus) && !altar);
-        el.cheerText.textContent = bonus
+        (rec.parts || []).forEach(p => {
+          if (!p.text) return;
+          const span = document.createElement("span");
+          if (p.cls) span.className = p.cls;
+          span.textContent = `${p.text} `;
+          el.recDetail.appendChild(span);
+        });
+        const death = rec.tone === "death";
+        el.summaryCard.classList.toggle("altar", Boolean(altar) && !death);
+        el.summaryCard.classList.toggle("streak", Boolean(bonus) && !altar && !death);
+        el.summaryCard.classList.toggle("death", death);
+        el.cheerText.textContent = bonus && !death
           ? "연속 강하 보너스 획득! 바닥에 떨어진 골드·실링 꼭 챙기세요!"
-          : (altar && rec.active ? "제단 효과 획득! 운이 따르고 있습니다, 이대로 깊게 내려가 봅시다!" : rec.cheer);
+          : (altar && rec.active && rec.direction !== "stop" ? "제단 효과 획득! 운이 따르고 있습니다, 이대로 깊게 내려가 봅시다!" : rec.cheer);
 
+        el.stateSummary.classList.toggle("mode-line", Boolean(state.abyss && state.stream));
         if (!state.stream) {
           el.stateSummary.textContent = "좌측 상단 HUD 자동 인식 대기";
         } else if (state.ocrFailed) {
           el.stateSummary.textContent = "HUD 인식 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
         } else if (!state.ocrReady) {
           el.stateSummary.textContent = "HUD 인식 준비 중…";
+        } else if (state.abyss) {
+          el.stateSummary.textContent = state.abyssSafe === null
+            ? "나락 모드 · 생존 층 확인 중"
+            : `나락 모드 · ${PARITY_NAME[state.abyssSafe]} 층 생존`;
         } else {
           el.stateSummary.textContent = "HUD 자동 인식 중";
         }
@@ -1169,7 +1484,39 @@
         }
         // 판이 끝나면 '중단하고 보상 받기' 자리에 '다시하기 / 나가기' 버튼이 나옴
         const ended = /나\s?가\s?기|다\s?시\s?하\s?기/.test(text);
-        return { floor, turns, ended, abyss: /나\s?락|부\s?활/.test(text), raw: text.slice(0, 80) };
+        return { floor, turns, ended, abyss: isAbyssText(text), raw: text.slice(0, 80) };
+      }
+
+      // 나락 HUD에만 있는 글자: 위쪽 '나락', '부활 횟수' 줄 ('브화 회스' 등으로 읽히는 경우 허용)
+      function isAbyssText(text) {
+        return /나\s?락|부\s?활|[부브]\s?[활화]\s?[횟회]\s?[수스]|활\s?[횟회]\s?수/.test(text || "");
+      }
+
+      // 부활 횟수 줄: '부활 횟수 (구슬 아이콘) X 1' → 마지막 숫자 (0~3만 인정)
+      function parseReviveText(rawText) {
+        const t = (rawText || "").replace(/\s+/g, " ");
+        const m = t.match(/[부브]\s?[활화]\s?[횟회]\s?[수스]|활\s?[횟회]\s?[수스]|[횟회]\s?수/);
+        if (!m) return null;
+        const tail = t.slice(m.index + m[0].length, m.index + m[0].length + 12);
+        const digits = tail.match(/[0-9ㅣlI|]/g);
+        if (!digits) return null;
+        const c = digits[digits.length - 1];
+        const n = /[ㅣlI|]/.test(c) ? 1 : parseInt(c, 10);
+        return n >= 0 && n <= 3 ? n : null;
+      }
+
+      // 로비 안내 문구: '홀수 층은 생존, 짝수 층은 사망합니다.' → 1(홀수 생존) / 0(짝수 생존)
+      function parseParityText(rawText) {
+        const t = (rawText || "").replace(/\s+/g, "");
+        const odd = t.match(/[홀흘횰]수.{0,4}?(생[존조]|사[망믿만])/);
+        const even = t.match(/[짝짜쪽]수.{0,4}?(생[존조]|사[망믿만])/);
+        const oddSafe = odd ? odd[1].startsWith("생") : null;
+        const evenSafe = even ? even[1].startsWith("생") : null;
+        const votesOdd = (oddSafe === true ? 1 : 0) + (evenSafe === false ? 1 : 0);
+        const votesEven = (oddSafe === false ? 1 : 0) + (evenSafe === true ? 1 : 0);
+        if (votesOdd && !votesEven) return 1;
+        if (votesEven && !votesOdd) return 0;
+        return null;
       }
 
       // 같은 값이 STABLE_READS번 읽혀야 확정 (못 읽은 프레임은 건너뜀)
@@ -1188,9 +1535,106 @@
         state.runDeltas = [];
         state.ended = false;
         state.endedHits = 0;
-        state.abyss = false;
-        state.abyssHits = 0;
         state.sideChoice = null;
+        // 새 판의 HUD에서 이미 나락 글자가 연속으로 보였으면 바로 나락으로 시작
+        state.abyss = false;
+        state.abyssSafe = null;
+        state.parityRead = { value: null, hits: 0 };
+        state.revives = null;
+        state.reviveRead = { value: null, hits: 0 };
+        state.revivesAtArrival = null;
+        state.deadlyArrivalAt = 0;
+        state.abyssDeath = null;
+        state.abyssFailed = false;
+        if (state.abyssHits >= STABLE_READS) enterAbyss();
+      }
+
+      function enterAbyss() {
+        state.abyss = true;
+        if (state.revives === null) state.revives = ABYSS_DEFAULT_REVIVES; // 공식 규칙: 기본 부활 1회 (HUD를 읽으면 그 값으로 바뀜)
+        state.lastSideOcrAt = 0; // 부활 횟수·홀짝 안내를 바로 읽음
+        state.sideChoice = null;
+      }
+
+      // 나락 층 도착: 홀짝 규칙상 사망 층이면 부활 1회 사용 (부활이 없으면 보상 소멸)
+      function abyssArrival(f) {
+        state.abyssDeath = null;
+        state.revivesAtArrival = state.revives;
+        if (state.abyssSafe === null || f >= MAX_FLOOR || f % 2 === state.abyssSafe) return;
+        state.deadlyArrivalAt = Date.now();
+        const k = state.revives === null ? ABYSS_DEFAULT_REVIVES : state.revives;
+        if (k > 0) {
+          state.revives = k - 1;
+          state.abyssDeath = { floor: f, revived: true };
+        } else {
+          state.abyssDeath = { floor: f, revived: false };
+          state.abyssFailed = true;
+        }
+      }
+
+      // 나락: 다음 강하를 시작했다 = 이 층에서 살아 있었다 → HUD 부활 횟수로 홀짝 규칙 확인·보정
+      function verifyAbyssOnDeparture() {
+        const f = state.floor;
+        const s = state.reviveRead;
+        const hud = s.hits >= STABLE_READS ? s.value : null;
+        if (!f || f >= MAX_FLOOR || hud === null || state.revivesAtArrival === null) return;
+        const died = hud < state.revivesAtArrival;
+        if (state.abyssSafe === null) {
+          state.abyssSafe = died ? 1 - (f % 2) : f % 2;
+        } else if (!died && state.abyssDeath && state.abyssDeath.floor === f) {
+          // 사망 층으로 계산했는데 부활 횟수가 그대로 → 홀짝 규칙을 잘못 읽은 것으로 보고 바로잡음
+          state.abyssSafe = f % 2;
+          state.abyssDeath = null;
+          state.abyssFailed = false;
+          state.revives = hud;
+        }
+      }
+
+      // HUD에서 읽은 부활 횟수 반영 (2번 연속 같은 값일 때)
+      function applyReviveReading(k) {
+        if (k === null) return;
+        const s = state.reviveRead;
+        if (s.value === k) s.hits++;
+        else {
+          s.value = k;
+          s.hits = 1;
+        }
+        if (s.hits < STABLE_READS || k === state.revives) return;
+        const f = state.floor;
+        if (state.revives === null) {
+          state.revives = k;
+        } else if (k < state.revives) {
+          // 예상하지 못한 사망 (홀짝 규칙을 아직 몰랐던 경우 등) → 이번 층이 사망 층
+          if (f && f < MAX_FLOOR && (state.abyssSafe === null || f % 2 !== state.abyssSafe)) {
+            state.abyssSafe = 1 - (f % 2);
+            state.abyssDeath = { floor: f, revived: true };
+          }
+          state.revives = k;
+        } else {
+          // HUD 값이 더 큼: 사망 층이면 부활 처리 전이라 HUD가 아직 이전 값 → 무시
+          if (state.abyssDeath && state.abyssDeath.floor === f) return;
+          const altarLife = f && f % 11 === 0 && state.altarFloor === f && k === state.revives + 1 &&
+            Date.now() - state.arrivedAt < ALTAR_WATCH_MS + 5000;
+          if (altarLife) state.altarEffect = ALTAR.life; // 특수층에서 부활 횟수 증가 = '생명+1'
+          else if (s.hits < STABLE_READS + 1) return;
+          state.revives = k;
+        }
+        refreshRecommendation(false);
+      }
+
+      // 로비 안내 문구로 읽은 생존 층 반영 (2번 연속 같은 값일 때)
+      function applyParityReading(p) {
+        if (p === null) return;
+        const s = state.parityRead;
+        if (s.value === p) s.hits++;
+        else {
+          s.value = p;
+          s.hits = 1;
+        }
+        if (s.hits >= STABLE_READS && state.abyssSafe !== p) {
+          state.abyssSafe = p;
+          refreshRecommendation(false);
+        }
       }
 
       // 층이 확정적으로 바뀌었을 때: 실제 가능한 이동이면 출발 당시 추천과 함께 기록하고 다음 추천
@@ -1200,19 +1644,27 @@
         const dep = state.departureRec;
         state.lastMove = null;
         if (prev !== null && dep && dep.active && dep.floor === prev && isPossibleMove(prev, newFloor)) {
-          appendMoveRecord({
-            floorBefore: prev,
-            floorAfter: newFloor,
-            direction: dep.direction,
-            remainingTurns: dep.turns,
-            gamble: isGamblePoint(prev)
-          });
+          // 나락 이동은 지옥 통계(가운데 대강하 비율·좌우 비교)와 섞이지 않도록 서버에 기록하지 않음
+          if (!state.abyss) {
+            appendMoveRecord({
+              floorBefore: prev,
+              floorAfter: newFloor,
+              direction: dep.direction,
+              remainingTurns: dep.turns,
+              gamble: isGamblePoint(prev)
+            });
+          }
           state.lastMove = { from: prev, to: newFloor, direction: dep.direction };
+          if (newFloor % 11 === 0) {
+            state.altarDepTurns = dep.turns;
+            state.altarTurnsChecked = false;
+          }
           state.runDeltas.push(newFloor - prev);
         } else if (prev !== null) {
           state.runDeltas = []; // 이동을 놓쳤으면 연속 기록을 알 수 없으므로 초기화
         }
         if (newFloor === 0) resetForNewRun();
+        else if (state.abyss && prev !== null && newFloor > prev && isPossibleMove(prev, newFloor)) abyssArrival(newFloor);
         state.floor = newFloor;
         state.arrivedAt = Date.now();
         state.departureLocked = false;
@@ -1228,11 +1680,9 @@
         let needRefresh = false;
         let newRun = false;
 
+        // 나락 글자가 보인 연속 판독 수 (층·횟수를 다 읽었는데 안 보이면 0으로)
         if (parsed.abyss) state.abyssHits++;
-        if (!state.abyss && state.abyssHits >= STABLE_READS) {
-          state.abyss = true;
-          needRefresh = true;
-        }
+        else if (parsed.floor !== null && parsed.turns !== null) state.abyssHits = 0;
 
         // 판 종료 버튼이 연속으로 보이면 이번 판 종료
         state.endedHits = parsed.ended ? state.endedHits + 1 : 0;
@@ -1258,10 +1708,17 @@
           } else if (!floorChanged && prevTurns !== null && turnsC < prevTurns &&
                      Date.now() - state.arrivedAt > DEPARTURE_GAP_MS) {
             // 층은 그대로인데 횟수만 줄어듦 = 강하를 시작함 → 출발 당시 추천을 기록용으로 고정
+            if (state.abyss) verifyAbyssOnDeparture();
             state.departureLocked = true;
             state.lockedAt = Date.now();
           }
           needRefresh = true; // 0회가 되면 추천 종료, 늘거나 늦게 읽힌 경우 다시 계산
+        }
+
+        // 나락 판단 (한 판 안에서는 유지, 새 판이 시작될 때 다시 판단)
+        if (!state.abyss && state.abyssHits >= STABLE_READS) {
+          enterAbyss();
+          needRefresh = true;
         }
 
         if (floorChanged) {
@@ -1312,18 +1769,66 @@
       /* 11층 단위 제단 효과: 화면 가운데 위에 '"상자+1" 효과를 획득하였습니다' 같은 안내가 뜸.
        * 11층 단위 층에 도착한 뒤 잠깐 동안만 그 부분을 읽어, 공식 제단 효과 4종 중 무엇인지 알려 줌 */
       const ALTAR_WATCH_MS = 10000;
-      const ALTAR_EFFECTS = [
-        { re: /풍\s?요/, name: "풍요", desc: "보상 상자 1개가 풍요 상자로 바뀝니다" },
-        { re: /상\s?자/, name: "상자+1", desc: "종료 시 보상 상자가 1개 추가됩니다" },
-        { re: /최\s?소|1\s?6\s?층/, name: "최소 16층", desc: "다음 강하는 최소 16층 이상 내려갑니다" },
-        { re: /강\s?하|이\s?동|횟\s?수|기\s?회/, name: "강하+1", desc: "강하 횟수가 1회 늘었습니다" }
-      ];
+      const ALTAR = {
+        boon: { name: "풍요", desc: "보상 상자 1개가 풍요 상자로 바뀝니다" },
+        box: { name: "상자+1", desc: "종료 시 보상 상자가 1개 추가됩니다" },
+        leap: { name: "최소 16층", desc: "다음 강하는 최소 16층 이상 내려갑니다" },
+        turn: { name: "강하+1", desc: "강하 횟수가 1회 늘었습니다" },
+        life: { name: "생명+1", desc: "부활 횟수가 1회 늘었습니다" } // 나락 전용
+      };
 
+      // 나락 HUD의 '부활 횟수 X N' 줄과 로비의 '홀수 층은 생존, 짝수 층은 사망합니다.' 문구 위치 (화면 비율)
+      const REVIVE_BOX = { x: 0.01, y: 0.165, w: 0.12, h: 0.03 };
+      const HINT_BOX = { x: 0.01, y: 0.335, w: 0.15, h: 0.055 };
+
+      // 화면 일부를 잘라 읽음: luma = 밝기 기준 흑백(밝은 글씨 → 검은 글씨), color = 게임 화면 색 그대로
+      async function recognizeBox(box, W, mode) {
+        const v = el.video;
+        const vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
+        const sx = Math.floor(vw * box.x), sy = Math.floor(vh * box.y);
+        const sw = Math.max(1, Math.floor(vw * box.w)), sh = Math.max(1, Math.floor(vh * box.h));
+        const H = Math.max(24, Math.round(W * sh / sw));
+        const cv = state.sideCanvas || (state.sideCanvas = document.createElement("canvas"));
+        cv.width = W;
+        cv.height = H;
+        const ctx = cv.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(v, sx, sy, sw, sh, 0, 0, W, H);
+        if (mode === "luma") {
+          const img = ctx.getImageData(0, 0, W, H);
+          const d = img.data;
+          for (let i = 0; i < d.length; i += 4) {
+            const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+            const g = 255 - Math.min(255, Math.max(0, (y - 60) * 255 / 140));
+            d[i] = d[i + 1] = d[i + 2] = g;
+          }
+          ctx.putImageData(img, 0, 0);
+        }
+        const { data } = await state.ocrWorker.recognize(cv);
+        return data && data.text ? data.text : "";
+      }
+
+      // 1순위: '효과를 획득' 바로 앞의 효과 이름("상자+1", "강하+1" 등)으로 판정
+      // 2순위: 이름을 못 읽었을 때만 설명 문구로 판정 (도착 시 함께 보이는 다른 글자의 '16층' 등에 속지 않도록 '최소'만 인정)
       function parseAltarText(rawText) {
         const t = (rawText || "").replace(/\s+/g, " ");
-        if (!/효\s?과\s?를?\s?획\s?득/.test(t)) return null;
-        const hit = ALTAR_EFFECTS.find(e => e.re.test(t));
-        return hit ? { name: hit.name, desc: hit.desc } : { name: null, desc: "" };
+        const m = t.match(/효\s?과\s?를?\s?획\s?득/);
+        if (!m) return null;
+        // 따옴표 안의 효과 이름만 사용 (따옴표를 못 읽었으면 바로 앞 12글자)
+        const before = t.slice(0, m.index);
+        const q = before.match(/["“”‘’']\s*([^"“”‘’']{1,10}?)\s*["“”‘’']?\s*$/);
+        const name = q ? q[1] : before.slice(-12);
+        if (/풍\s?요/.test(name)) return ALTAR.boon;
+        if (/상\s?자/.test(name)) return ALTAR.box;
+        if (/생\s?명/.test(name)) return ALTAR.life;
+        if (/최\s?소/.test(name)) return ALTAR.leap;
+        if (/강\s?하/.test(name)) return ALTAR.turn;
+        if (/1\s?6/.test(name)) return ALTAR.leap;
+        if (/풍\s?요/.test(t)) return ALTAR.boon;
+        if (/상\s?자/.test(t)) return ALTAR.box;
+        if (/생\s?명|부\s?활/.test(t)) return ALTAR.life;
+        if (/최\s?소/.test(t)) return ALTAR.leap;
+        if (/횟\s?수|기\s?회/.test(t)) return ALTAR.turn;
+        return { name: null, desc: "" };
       }
 
       async function readAltarBanner() {
@@ -1374,7 +1879,10 @@
           `${APP_VERSION} · 공유 화면 ${v.videoWidth}×${v.videoHeight}`,
           `읽은 글자${reused ? "(변화 없음)" : ""}${parsed.assisted ? "(보조 판독 사용)" : ""}: ${parsed.raw || "없음"}`,
           `이번 판독: ${show(parsed.floor)}층 / ${show(parsed.turns)}회${parsed.ended ? " · 종료 버튼" : ""} → 확정: ${show(state.floor)}층 / ${show(state.turns)}회${state.ended ? " · 판 종료" : ""}`,
-          `제단: ${state.altarEffect ? (state.altarEffect.name || "효과") + " 확인" : (Date.now() < state.altarUntil ? state.altarFloor + "층 안내 확인 중" : "-")}`
+          `제단: ${state.altarEffect ? (state.altarEffect.name || "효과") + " 확인" : (Date.now() < state.altarUntil ? state.altarFloor + "층 안내 확인 중" : "-")}`,
+          `나락: ${state.abyss ? "예" : "아니오"} · 생존 층 ${state.abyssSafe === null ? "-" : PARITY_NAME[state.abyssSafe]}` +
+            ` · 부활 ${show(state.revives)} (HUD ${show(state.reviveRead.value)}/${state.reviveRead.hits})` +
+            `${state.abyssFailed ? " · 보상 소멸" : ""}`
         ].forEach(t => {
           const line = document.createElement("span");
           line.textContent = t;
@@ -1407,12 +1915,14 @@
             // 글자 줄은 보이는데 숫자를 못 읽었으면 회색조 → 원본 색 그대로 순서로 다시 읽어 빈 값만 채움
             for (const mode of ["luma", "max", "color"]) {
               const needTurns = parsed.turns === null && /[강감]\s?[하허]|가\s?[능늠]/.test(text);
-              const needFloor = parsed.floor === null && /지\s?[하허히]|로\s?비/.test(text);
+              // '강하 N회' 줄이 보이면 HUD가 떠 있는 것이므로 제목(층수)이 깨져 읽혀도 다시 읽음 (나락 HUD 배경이 밝아 깨지기 쉬움)
+              const needFloor = parsed.floor === null && (parsed.turns !== null || /지\s?[하허히]|로\s?비/.test(text));
               if (!needTurns && !needFloor) break;
               const r2 = await state.ocrWorker.recognize(makeGrayCanvas(crop, mode));
               const p2 = parseHudText(r2.data && r2.data.text ? r2.data.text : "");
               if (needTurns && p2.turns !== null) { parsed.turns = p2.turns; parsed.assisted = true; }
               if (needFloor && p2.floor !== null) { parsed.floor = p2.floor; parsed.assisted = true; }
+              if (p2.abyss) parsed.abyss = true;
             }
             state.lastParsed = parsed;
             state.lastHudBits = crop.bits;
@@ -1425,10 +1935,29 @@
             state.altarEffect = null;
           }
           applyHudReading(parsed);
+          // 나락: 부활 횟수 줄과 로비의 홀짝 안내 문구를 따로 잘라 읽음 (일정 간격)
+          if (state.abyss && Date.now() - state.lastSideOcrAt >= ABYSS_SIDE_OCR_MS) {
+            state.lastSideOcrAt = Date.now();
+            if (state.abyssSafe === null) {
+              applyParityReading(parseParityText(await recognizeBox(HINT_BOX, 720, "color")));
+            }
+            let k = parseReviveText(await recognizeBox(REVIVE_BOX, 480, "luma"));
+            if (k === null) k = parseReviveText(await recognizeBox(REVIVE_BOX, 480, "color"));
+            applyReviveReading(k);
+          }
           if (!state.altarEffect && Date.now() < state.altarUntil) {
             const effect = await readAltarBanner();
             if (effect) {
               state.altarEffect = effect;
+              render();
+            }
+          }
+          // 제단 층 도착 3초 뒤 남은 강하가 출발 때와 같으면(원래는 1 줄어야 함) '강하+1' 확정
+          if (state.floor && state.floor % 11 === 0 && state.altarFloor === state.floor && !state.altarTurnsChecked &&
+              Date.now() - state.arrivedAt >= 3000) {
+            state.altarTurnsChecked = true;
+            if (state.altarDepTurns !== null && state.turns !== null && state.turns === state.altarDepTurns) {
+              state.altarEffect = ALTAR.turn;
               render();
             }
           }
@@ -1496,6 +2025,8 @@
         el.video.srcObject = null;
         state.read.floor = { value: null, hits: 0 };
         state.read.turns = { value: null, hits: 0 };
+        state.reviveRead = { value: null, hits: 0 };
+        state.parityRead = { value: null, hits: 0 };
         state.lastParsed = null;
         state.lastHudBits = null;
         state.watchBoxes = null;
