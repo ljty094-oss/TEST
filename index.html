@@ -308,6 +308,9 @@
       const STABLE_READS = 2;         // 같은 값이 연속 2번 읽혀야 확정 (강하 연출 중 오인식 방지)
       const HUD_SAME_PIXELS = 25;     // 글자 줄에서 바뀐 픽셀이 이보다 적으면 OCR 생략 (숫자 한 글자 변화는 수십~수백 픽셀)
       const DEPARTURE_GAP_MS = 2500;  // 층 도착 후 이 시간이 지나 남은 횟수가 줄면 '강하 시작'으로 판단
+      const RETRY_OCR_MS = 1000;      // 층수나 남은 횟수를 못 읽은 상태면 화면 변화와 관계없이 이 간격으로 다시 읽음
+      const FORCE_OCR_MS = 3000;      // 화면 변화가 없어 보여도 이 간격마다 한 번은 다시 읽음 (놓친 변화 보정)
+      const DEPARTURE_TIMEOUT_MS = 12000; // '강하 시작'으로 판단한 뒤 이 시간 안에 층이 안 바뀌면 판단 취소
       const REMOTE_REFRESH_MS = 60000;
       const REMOTE_PAGE_SIZE = 1000;
       const REMOTE_MAX_PAGES = 10;
@@ -402,8 +405,10 @@
         },
         lastHudBits: null,
         watchBoxes: null,      // 직전 판독에서 층수·남은 횟수 글자가 있던 위치 (이 부분만 비교)
+        lastOcrAt: 0,          // 마지막으로 OCR을 실행한 시각
         arrivedAt: 0,          // 현재 층을 확정한 시각
         departureLocked: false,// 강하 시작이 감지되어 출발 당시 추천을 고정했는지
+        lockedAt: 0,           // 강하 시작으로 판단한 시각
         departureRec: null,    // 기록에 남길 '출발 당시 추천'
         lastMove: null,        // 직전 강하 { from, to, direction } (안내 문구용)
         lastParsed: null,
@@ -1069,6 +1074,12 @@
           needRefresh = true;
         }
 
+        // 강하 시작으로 판단했는데 한참 지나도 층이 안 바뀌면 (남은 횟수만 늦게 읽힌 경우) 판단 취소
+        if (state.departureLocked && !floorChanged && Date.now() - state.lockedAt > DEPARTURE_TIMEOUT_MS) {
+          state.departureLocked = false;
+          needRefresh = true;
+        }
+
         if (turnsC !== null && turnsC !== state.turns) {
           const prevTurns = state.turns;
           state.turns = turnsC;
@@ -1080,6 +1091,7 @@
                      Date.now() - state.arrivedAt > DEPARTURE_GAP_MS) {
             // 층은 그대로인데 횟수만 줄어듦 = 강하를 시작함 → 출발 당시 추천을 기록용으로 고정
             state.departureLocked = true;
+            state.lockedAt = Date.now();
           }
           needRefresh = true; // 0회가 되면 추천 종료, 늘거나 늦게 읽힌 경우 다시 계산
         }
@@ -1137,9 +1149,16 @@
           const crop = prepareHighContrastHudCrop();
           const width = crop.canvas.width;
           let parsed;
-          if (state.lastParsed && hudChangedPixels(crop.bits, width) < HUD_SAME_PIXELS) {
-            parsed = state.lastParsed; // 글자 변화 없음 → 직전 판독 결과 재사용
+          const now = Date.now();
+          const last = state.lastParsed;
+          const incomplete = !last || last.floor === null || last.turns === null;
+          const canReuse = last &&
+            (incomplete ? now - state.lastOcrAt < RETRY_OCR_MS : now - state.lastOcrAt < FORCE_OCR_MS) &&
+            hudChangedPixels(crop.bits, width) < HUD_SAME_PIXELS;
+          if (canReuse) {
+            parsed = last; // 글자 변화 없음 → 직전 판독 결과 재사용
           } else {
+            state.lastOcrAt = now;
             const { data } = await state.ocrWorker.recognize(crop.canvas, {}, { text: true, blocks: true });
             parsed = parseHudText(data && data.text ? data.text : "");
             state.lastParsed = parsed;
