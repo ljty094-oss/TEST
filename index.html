@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>지옥 강하 추천기 (초단순 기록형)</title>
+  <title>지옥 강하 추천기 (자동 HUD 인식형)</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     :root {
       --bg: #0c0e14;
@@ -251,11 +252,11 @@
           <span id="liveDot" class="dot"></span>
           <span id="statusText">화면 공유 대기 중</span>
         </div>
-        <div id="stateSummary" class="meta-sub">자동 열쇠·등급·횟수 인식 대기</div>
+        <div id="stateSummary" class="meta-sub">좌측 상단 HUD 자동 인식 대기</div>
       </div>
       <div class="btn-row">
         <div class="floor-badge">
-          <span class="label">추정 층수</span>
+          <span class="label">현재 층수</span>
           <span id="floorDisplay" class="value">-층</span>
         </div>
         <button id="toggleShareBtn" class="primary" type="button">화면 공유 시작</button>
@@ -279,7 +280,7 @@
 
     <div class="summary-card">
       <div id="recHeadline" class="rec-headline">공유를 시작하면 자동으로 추천합니다</div>
-      <div id="recDetail" class="rec-detail">화면 변화량과 사용자별 누적 기록·열쇠 조건으로 방향 점수를 계산합니다.</div>
+      <div id="recDetail" class="rec-detail">좌측 상단 '지하 N층' 및 '강하 N회 가능' HUD를 자동으로 읽어 방향 점수를 계산합니다.</div>
       <div id="cheerText" class="cheer-line">오늘도 대박 층수 노려봅시다!</div>
     </div>
 
@@ -291,6 +292,7 @@
 
   <video id="hiddenVideo" class="hidden-capture" autoplay muted playsinline></video>
   <canvas id="hiddenCanvas" class="hidden-capture"></canvas>
+  <canvas id="hudCanvas" class="hidden-capture"></canvas>
 
   <script>
     (function () {
@@ -302,8 +304,8 @@
         customPostUrl: ""
       };
       const USER_ID_KEY = "hell_descent_user_id_v1";
-      const CAPTURE_INTERVAL_MS = 3000;
-      const MIN_SCENE_DIFF_RATIO = 0.04;
+      const CAPTURE_INTERVAL_MS = 3500;
+      const MIN_SCENE_DIFF_RATIO = 0.025;
 
       const KEY_LABELS = {
         hell: "지옥 열쇠",
@@ -362,6 +364,9 @@
         userId,
         stream: null,
         timerId: null,
+        isBusy: false,
+        ocrWorker: null,
+        ocrReady: false,
         lastSamplePixels: null,
         lastFloor: null,
         lastTurn: 0,
@@ -384,6 +389,7 @@
         cheerText: document.getElementById("cheerText"),
         video: document.getElementById("hiddenVideo"),
         canvas: document.getElementById("hiddenCanvas"),
+        hudCanvas: document.getElementById("hudCanvas"),
         cards: {
           left: document.getElementById("card-left"),
           center: document.getElementById("card-center"),
@@ -395,6 +401,22 @@
           right: document.getElementById("sub-right")
         }
       };
+
+      async function initOcr() {
+        if (state.ocrReady || !window.Tesseract) return;
+        try {
+          state.ocrWorker = await window.Tesseract.createWorker("kor+eng", 1, {
+            logger: () => {}
+          });
+          await state.ocrWorker.setParameters({
+            tessedit_pageseg_mode: window.Tesseract.PSM.SPARSE_TEXT
+          });
+          state.ocrReady = true;
+        } catch (err) {
+          console.warn("OCR 초기화 실패(폴백 모드 동작):", err);
+          state.ocrReady = false;
+        }
+      }
 
       function loadRecords() {
         try {
@@ -419,6 +441,8 @@
       }
 
       async function pushRecordToExternalDb(record) {
+        if (!isSupabaseConfigured() && !EXTERNAL_DB_CONFIG.customPostUrl) return;
+
         if (isSupabaseConfigured()) {
           const baseUrl = EXTERNAL_DB_CONFIG.supabaseUrl.replace(/\/+$/, "");
           const table = encodeURIComponent(EXTERNAL_DB_CONFIG.supabaseTable);
@@ -454,14 +478,11 @@
 
         if (EXTERNAL_DB_CONFIG.customPostUrl) {
           try {
-            const res = await fetch(EXTERNAL_DB_CONFIG.customPostUrl, {
+            await fetch(EXTERNAL_DB_CONFIG.customPostUrl, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(record)
             });
-            if (!res.ok) {
-              console.warn("외부 엔드포인트 응답 오류:", res.status);
-            }
           } catch (err) {
             console.warn("외부 엔드포인트 전송 실패:", err);
           }
@@ -511,7 +532,7 @@
           const dr = Math.abs(sampled[i] - state.lastSamplePixels[i]);
           const dg = Math.abs(sampled[i + 1] - state.lastSamplePixels[i + 1]);
           const db = Math.abs(sampled[i + 2] - state.lastSamplePixels[i + 2]);
-          if (dr + dg + db > 45) {
+          if (dr + dg + db > 40) {
             changedChannels++;
           }
         }
@@ -526,12 +547,66 @@
         return true;
       }
 
-      function detectGameContext(ctx, w, h) {
+      function prepareHighContrastHudCrop(videoEl, hudCanvasEl) {
+        const vw = videoEl.videoWidth || 1280;
+        const vh = videoEl.videoHeight || 720;
+        // 좌측 상단 HUD ('지하 15층', '강하 3회 가능') 영역 크롭 및 확대
+        const sx = Math.floor(vw * 0.005);
+        const sy = Math.floor(vh * 0.02);
+        const sw = Math.floor(vw * 0.16);
+        const sh = Math.floor(vh * 0.27);
+
+        const targetW = 480;
+        const targetH = 320;
+        hudCanvasEl.width = targetW;
+        hudCanvasEl.height = targetH;
+
+        const hctx = hudCanvasEl.getContext("2d");
+        hctx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, targetW, targetH);
+
+        const imgData = hctx.getImageData(0, 0, targetW, targetH);
+        const d = imgData.data;
+        // 밝은 글씨(층수/횟수) 대비를 높여 OCR 인식률 향상
+        for (let i = 0; i < d.length; i += 4) {
+          const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          const boosted = lum > 135 ? 255 : (lum < 65 ? 0 : Math.min(255, Math.max(0, (lum - 65) * 3.6)));
+          d[i] = boosted;
+          d[i + 1] = boosted;
+          d[i + 2] = boosted;
+        }
+        hctx.putImageData(imgData, 0, 0);
+        return hudCanvasEl;
+      }
+
+      function parseFloorFromOcrText(rawText) {
+        if (!rawText) return null;
+        const normalized = rawText.replace(/\s+/g, " ");
+        // '지하 15층', '15층', '15 층' 패턴 우선 추출
+        const floorMatch = normalized.match(/(?:지하\s*)?(\d{1,3})\s*층/);
+        if (floorMatch) {
+          const n = parseInt(floorMatch[1], 10);
+          if (n >= 1 && n <= 100) return n;
+        }
+        return null;
+      }
+
+      function parseTurnsFromOcrText(rawText) {
+        if (!rawText) return null;
+        const normalized = rawText.replace(/\s+/g, " ");
+        const turnMatch = normalized.match(/강하\s*(\d)\s*회/);
+        if (turnMatch) {
+          const t = parseInt(turnMatch[1], 10);
+          if (t >= 0 && t <= 6) return t;
+        }
+        return null;
+      }
+
+      async function detectGameContext(ctx, w, h, videoEl) {
         const keyBadgeArea = ctx.getImageData(
-          Math.floor(w * 0.02),
+          Math.floor(w * 0.01),
           Math.floor(h * 0.04),
-          Math.floor(w * 0.14),
-          Math.floor(h * 0.18)
+          Math.floor(w * 0.15),
+          Math.floor(h * 0.20)
         ).data;
         const centerMsg = ctx.getImageData(
           Math.floor(w * 0.32),
@@ -577,24 +652,55 @@
         for (let i = 0; i < centerMsg.length; i += 16) {
           if (centerMsg[i] > 190 && centerMsg[i + 1] > 150 && centerMsg[i + 2] < 110) centerGold++;
         }
-
         const hasGambleAlert = centerGold > 25;
-        const turnIndex = state.lastTurn;
-        const stepJump = hasGambleAlert ? 14 : (9 + ((turnIndex * 3) % 7));
-        const estimatedFloor = state.lastFloor === null
-          ? 12
-          : Math.min(100, Math.max(1, state.lastFloor + stepJump));
 
-        const activeRemaining = state.lastTurn === 0
-          ? (detectedGrade === "legend" ? 4 : 3)
-          : state.remainingTurns;
+        let ocrFloor = null;
+        let ocrTurns = null;
+        let ocrTextSnippet = "";
+
+        if (state.ocrReady && state.ocrWorker && videoEl) {
+          try {
+            const processedHud = prepareHighContrastHudCrop(videoEl, el.hudCanvas);
+            const { data } = await state.ocrWorker.recognize(processedHud);
+            ocrTextSnippet = (data && data.text ? data.text : "").replace(/\s+/g, " ").trim().slice(0, 30);
+            ocrFloor = parseFloorFromOcrText(data && data.text ? data.text : "");
+            ocrTurns = parseTurnsFromOcrText(data && data.text ? data.text : "");
+          } catch (err) {
+            console.warn("OCR 인식 중 오류:", err);
+          }
+        }
+
+        let resolvedFloor;
+        let floorSource = "추정";
+        if (ocrFloor !== null) {
+          resolvedFloor = ocrFloor;
+          floorSource = "HUD 인식";
+        } else if (state.lastFloor !== null) {
+          // OCR이 잠깐 못 읽었을 때는 이전 층수에서 과도하게 튀지 않게 완만히 유지/진행
+          resolvedFloor = Math.min(100, Math.max(1, state.lastFloor + 5));
+          floorSource = "연속 보간";
+        } else {
+          resolvedFloor = 15;
+          floorSource = "초기값";
+        }
+
+        let activeRemaining;
+        if (ocrTurns !== null) {
+          activeRemaining = ocrTurns;
+        } else if (state.lastTurn === 0) {
+          activeRemaining = detectedGrade === "legend" ? 4 : 3;
+        } else {
+          activeRemaining = state.remainingTurns;
+        }
 
         state.keyType = detectedKeyType;
         state.grade = detectedGrade;
         state.remainingTurns = activeRemaining;
 
         return {
-          floor: estimatedFloor,
+          floor: resolvedFloor,
+          floorSource,
+          ocrTextSnippet,
           hasGambleAlert,
           remainingAtTurn: activeRemaining
         };
@@ -663,12 +769,12 @@
         ).length;
 
         if (bestDir === "center") {
-          return `[${state.userId}] ${keyName} · ${gradeName} · 추정 ${ctxInfo.floor}층 변수를 노릴 타이밍이라 '가운데'를 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
+          return `[${state.userId}] ${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층(${ctxInfo.floorSource}) 변수 타이밍이라 '가운데'를 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
         }
         if (bestDir === "right") {
-          return `[${state.userId}] ${keyName} · ${gradeName} · 추정 ${ctxInfo.floor}층 기준 더 깊은 층수와 생존 조건을 고려해 '오른쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
+          return `[${state.userId}] ${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층(${ctxInfo.floorSource}) 기준 더 깊은 층수와 생존 조건을 고려해 '오른쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
         }
-        return `[${state.userId}] ${keyName} · ${gradeName} · 추정 ${ctxInfo.floor}층 흐름과 열쇠 조건을 따져 안정적인 '왼쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
+        return `[${state.userId}] ${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층(${ctxInfo.floorSource}) 흐름과 열쇠 조건을 따져 안정적인 '왼쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
       }
 
       function pickCheerText(bestDir) {
@@ -677,8 +783,8 @@
       }
 
       function appendAutoRecord(direction, ctxInfo) {
-        const prevFloor = state.lastFloor ?? 0;
-        const delta = Math.max(1, ctxInfo.floor - prevFloor);
+        const prevFloor = state.lastFloor ?? ctxInfo.floor;
+        const delta = Math.max(1, Math.abs(ctxInfo.floor - prevFloor) || 1);
 
         const newRecord = {
           userId: state.userId,
@@ -732,31 +838,36 @@
         if (el.cheerText) {
           el.cheerText.textContent = pickCheerText(bestDir);
         }
-        el.stateSummary.textContent = `${keyName} · ${gradeName} · 남은 ${ctxInfo.remainingAtTurn}회 · ${state.lastTurn}회차`;
+        el.stateSummary.textContent = `${keyName} · ${gradeName} · 남은 ${ctxInfo.remainingAtTurn}회 · ${ctxInfo.floorSource}`;
       }
 
-      function captureTick() {
-        if (!state.stream || !el.video || el.video.readyState < 2) return;
+      async function captureTick() {
+        if (state.isBusy || !state.stream || !el.video || el.video.readyState < 2) return;
+        state.isBusy = true;
 
-        const w = 640;
-        const h = 360;
-        el.canvas.width = w;
-        el.canvas.height = h;
-        const ctx = el.canvas.getContext("2d");
-        ctx.drawImage(el.video, 0, 0, w, h);
+        try {
+          const w = 640;
+          const h = 360;
+          el.canvas.width = w;
+          el.canvas.height = h;
+          const ctx = el.canvas.getContext("2d");
+          ctx.drawImage(el.video, 0, 0, w, h);
 
-        if (!hasMeaningfulSceneChange(ctx, w, h)) return;
+          if (!hasMeaningfulSceneChange(ctx, w, h)) return;
 
-        const ctxInfo = detectGameContext(ctx, w, h);
-        const scores = {
-          left: scoreDirection("left", ctxInfo),
-          center: scoreDirection("center", ctxInfo),
-          right: scoreDirection("right", ctxInfo)
-        };
-        const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
+          const ctxInfo = await detectGameContext(ctx, w, h, el.video);
+          const scores = {
+            left: scoreDirection("left", ctxInfo),
+            center: scoreDirection("center", ctxInfo),
+            right: scoreDirection("right", ctxInfo)
+          };
+          const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
 
-        appendAutoRecord(bestDir, ctxInfo);
-        renderRecommendation(ctxInfo, scores, bestDir);
+          appendAutoRecord(bestDir, ctxInfo);
+          renderRecommendation(ctxInfo, scores, bestDir);
+        } finally {
+          state.isBusy = false;
+        }
       }
 
       async function startShare() {
@@ -792,8 +903,10 @@
             el.liveDot.classList.remove("error");
             el.liveDot.classList.add("live");
           }
-          if (el.statusText) el.statusText.textContent = "자동 캡처 진행 중";
+          if (el.statusText) el.statusText.textContent = "자동 HUD 인식 중";
           if (el.toggleShareBtn) el.toggleShareBtn.textContent = "공유 중지";
+
+          initOcr();
 
           const track = stream.getVideoTracks()[0];
           if (track) {
@@ -802,7 +915,7 @@
 
           clearInterval(state.timerId);
           state.timerId = setInterval(captureTick, CAPTURE_INTERVAL_MS);
-          setTimeout(captureTick, 500);
+          setTimeout(captureTick, 900);
         } catch (err) {
           const errName = err && err.name ? err.name : "Error";
           const errMsg = err && err.message ? err.message : "권한이 거부되었거나 차단되었습니다.";
