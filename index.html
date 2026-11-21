@@ -58,6 +58,7 @@
       display: flex;
       flex-direction: column;
       gap: 4px;
+      min-width: 0;
     }
 
     .status-title {
@@ -98,7 +99,7 @@
       border-radius: 12px;
       padding: 8px 12px;
       text-align: center;
-      min-width: 84px;
+      min-width: 76px;
     }
 
     .floor-badge .label {
@@ -239,8 +240,55 @@
       gap: 8px;
     }
 
+    .hud-debug-box {
+      background: #10141e;
+      border: 1px dashed #2d374e;
+      border-radius: 12px;
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .hud-debug-info {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .hud-ocr-raw {
+      color: #c5d6f5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #hudPreviewCanvas {
+      width: 120px;
+      height: 72px;
+      border-radius: 6px;
+      border: 1px solid #2b344b;
+      background: #07090e;
+      flex-shrink: 0;
+    }
+
     .hidden-capture {
       display: none;
+    }
+
+    /* display:none 영상은 일부 브라우저에서 프레임 갱신이 멈출 수 있어 화면 밖에 1px로 둡니다 */
+    .offscreen-video {
+      position: fixed;
+      left: -10px;
+      top: -10px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
     }
   </style>
 </head>
@@ -258,6 +306,10 @@
         <div class="floor-badge">
           <span class="label">현재 층수</span>
           <span id="floorDisplay" class="value">-층</span>
+        </div>
+        <div class="floor-badge">
+          <span class="label">남은 강하</span>
+          <span id="turnsDisplay" class="value">-회</span>
         </div>
         <button id="toggleShareBtn" class="primary" type="button">화면 공유 시작</button>
       </div>
@@ -280,8 +332,17 @@
 
     <div class="summary-card">
       <div id="recHeadline" class="rec-headline">공유를 시작하면 자동으로 추천합니다</div>
-      <div id="recDetail" class="rec-detail">좌측 상단 '지하 N층' 및 '강하 N회 가능' HUD를 자동으로 읽어 방향 점수를 계산합니다.</div>
+      <div id="recDetail" class="rec-detail">좌측 상단 '지하 N층' 및 '강하 N회 가능' HUD를 자동으로 읽어 방향을 추천합니다.</div>
       <div id="cheerText" class="cheer-line">오늘도 대박 층수 노려봅시다!</div>
+    </div>
+
+    <div class="hud-debug-box">
+      <div class="hud-debug-info">
+        <span id="hudReadStatus">HUD 인식: 대기 중</span>
+        <span id="hudOcrText" class="hud-ocr-raw">읽힌 글자: 없음</span>
+        <span id="dbStatus" class="hud-ocr-raw">데이터 서버: 확인 전</span>
+      </div>
+      <canvas id="hudPreviewCanvas" width="120" height="72"></canvas>
     </div>
 
     <div class="footer-bar">
@@ -290,34 +351,65 @@
     </div>
   </div>
 
-  <video id="hiddenVideo" class="hidden-capture" autoplay muted playsinline></video>
-  <canvas id="hiddenCanvas" class="hidden-capture"></canvas>
+  <video id="hiddenVideo" class="offscreen-video" autoplay muted playsinline></video>
   <canvas id="hudCanvas" class="hidden-capture"></canvas>
 
   <script>
     (function () {
-      const STORAGE_KEY = "hell_descent_simple_records_v1";
+      "use strict";
+
+      /* ==============================================================
+       * 1. 설정
+       * ============================================================== */
+      const STORAGE_KEY = "hell_descent_records_v2"; // v2: 실제 층 이동만 기록 (v1 기록은 사용 안 함)
+      const USER_ID_KEY = "hell_descent_user_id_v1";
       const EXTERNAL_DB_CONFIG = {
         supabaseUrl: "https://ggbsbxppkpewultsmiz.supabase.co",
         supabaseAnonKey: "sb_publishable_XGuZI--CLpwE5UliON-8Ew_Qx2GhSkM",
         supabaseTable: "hell_descent_records",
         customPostUrl: ""
       };
-      const USER_ID_KEY = "hell_descent_user_id_v1";
-      const CAPTURE_INTERVAL_MS = 3500;
-      const MIN_SCENE_DIFF_RATIO = 0.025;
+      // 이전 버전(v11)이 저장한 기록은 실제 층 이동이 아니어서 통계에서 제외합니다. (2026-11-22 00:00 KST 이후만 사용)
+      const DATA_SINCE = "2026-11-21T15:00:00Z";
 
-      const KEY_LABELS = {
-        hell: "지옥 열쇠",
-        abyss_flame: "나락의 화염 열쇠(짝수 생존)",
-        abyss_frost: "나락의 서리 열쇠(홀수 생존)"
-      };
+      const OCR_INTERVAL_MS = 1200;   // HUD 판독 주기
+      const STABLE_READS = 3;         // 같은 값이 3번 읽혀야 확정 (강하 연출 중 오인식 방지)
+      const HUD_SAME_PIXELS = 40;     // HUD 영역에서 바뀐 픽셀이 이보다 적으면 OCR 생략 (숫자 한 글자 변화는 수백 픽셀)
+      const REMOTE_REFRESH_MS = 60000;
+      const REMOTE_PAGE_SIZE = 1000;
+      const REMOTE_MAX_PAGES = 10;
 
-      const GRADE_LABELS = {
-        rare: "희귀",
-        hero: "영웅",
-        legend: "전설"
-      };
+      /* 공식 규칙 — 로스트아크 공식 게임 가이드 '낙원', 2025-09-09 업데이트 공지
+       * - 왼쪽/오른쪽: 1~20층 무작위, 각 층 확률 동일
+       * - 가운데(10층 단위 층에서만 등장): 대강하 15~20층 또는 상승 1~5층, 각 범위 안에서 균등
+       *   대강하/상승이 나올 비율은 미공개 → 수집 데이터로 추정
+       * - 보상 단계 = 도달 층의 10의 자리 (0~10단계) */
+      const MAX_FLOOR = 100;
+      const SIDE_MIN = 1, SIDE_MAX = 20;
+      const GRAND_MIN = 15, GRAND_MAX = 20;
+      const ASCENT_MIN = 1, ASCENT_MAX = 5;
+
+      /* 단계별 보상 가치 — loagg.com 지옥 보상표의 귀속 골드(1730 기준) 0·5·10단계 4,500 / 22,000 / 130,000G,
+       * 사이 단계는 기하 보간. 레벨 구간이 달라도 단계 간 비율은 거의 같아 추천 결과에 영향이 없습니다. */
+      const STAGE_VALUE = (function () {
+        const a0 = 4500, a5 = 22000, a10 = 130000;
+        const v = [];
+        for (let s = 0; s <= 10; s++) {
+          v.push(s <= 5 ? a0 * Math.pow(a5 / a0, s / 5) : a5 * Math.pow(a10 / a5, (s - 5) / 5));
+        }
+        return v;
+      })();
+
+      // 왼쪽/오른쪽 비교 기준값: 1~20층 균등분포 (평균 10.5, 표준편차 약 5.77)
+      const SIDE_PRIOR_MEAN = 10.5;
+      const SIDE_SD = Math.sqrt((20 * 20 - 1) / 12);
+      const SIDE_PRIOR_N = 40;
+      const SIDE_DIFF_Z = 2.5; // 이 이상 차이가 나야 '데이터상 유리'로 안내
+      // true: 대강하 비율이 아직 불확실하면 가끔 가운데를 추천해 데이터를 모읍니다 (데이터가 쌓일수록 줄어듦)
+      // false: 항상 현재 추정치 기준으로만 추천
+      const EXPLORE_CENTER = true;
+
+      const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽" };
 
       const CHEER_MESSAGES = {
         left: [
@@ -358,22 +450,36 @@
         }
       }
 
-      const userId = getOrCreateUserId();
-
+      /* ==============================================================
+       * 2. 상태
+       * ============================================================== */
       const state = {
-        userId,
+        userId: getOrCreateUserId(),
         stream: null,
         timerId: null,
+        remoteTimerId: null,
         isBusy: false,
         ocrWorker: null,
         ocrReady: false,
-        lastSamplePixels: null,
-        lastFloor: null,
-        lastTurn: 0,
-        keyType: "hell",
-        grade: "hero",
-        remainingTurns: 3,
-        records: loadRecords()
+        ocrFailed: false,
+        read: {
+          floor: { value: null, hits: 0 },
+          turns: { value: null, hits: 0 }
+        },
+        lastHudBits: null,
+        lastParsed: null,
+        abyssHits: 0,
+        abyss: false,          // HUD에 '나락'/'부활'이 보이면 나락으로 판단 (가운데 추천 안 함)
+        floor: null,           // 확정된 현재 층 (0 = 로비)
+        turns: null,           // 확정된 남은 강하 횟수
+        sideChoice: null,      // 이번 층에서 고른 왼쪽/오른쪽 (층이 바뀔 때만 새로 고름)
+        pSample: null,         // 이번 층에서 사용할 대강하 비율 (층이 바뀔 때만 새로 뽑음)
+        cheerIndex: 0,
+        rec: null,             // 현재 표시 중인 추천
+        records: loadRecords(),
+        remote: null,          // 서버에서 읽은 전체 기록 (실패 시 null)
+        dbStatus: "확인 전",
+        inFlight: new Set()    // 전송 중인 기록 (중복 전송 방지)
       };
 
       const el = {
@@ -381,6 +487,7 @@
         statusText: document.getElementById("statusText"),
         stateSummary: document.getElementById("stateSummary"),
         floorDisplay: document.getElementById("floorDisplay"),
+        turnsDisplay: document.getElementById("turnsDisplay"),
         toggleShareBtn: document.getElementById("toggleShareBtn"),
         resetRecordsBtn: document.getElementById("resetRecordsBtn"),
         recordCountText: document.getElementById("recordCountText"),
@@ -388,8 +495,11 @@
         recDetail: document.getElementById("recDetail"),
         cheerText: document.getElementById("cheerText"),
         video: document.getElementById("hiddenVideo"),
-        canvas: document.getElementById("hiddenCanvas"),
         hudCanvas: document.getElementById("hudCanvas"),
+        hudPreviewCanvas: document.getElementById("hudPreviewCanvas"),
+        hudReadStatus: document.getElementById("hudReadStatus"),
+        hudOcrText: document.getElementById("hudOcrText"),
+        dbStatus: document.getElementById("dbStatus"),
         cards: {
           left: document.getElementById("card-left"),
           center: document.getElementById("card-center"),
@@ -402,520 +512,753 @@
         }
       };
 
-      async function initOcr() {
-        if (state.ocrReady || !window.Tesseract) return;
-        try {
-          state.ocrWorker = await window.Tesseract.createWorker("kor+eng", 1, {
-            logger: () => {}
-          });
-          await state.ocrWorker.setParameters({
-            tessedit_pageseg_mode: window.Tesseract.PSM.SPARSE_TEXT
-          });
-          state.ocrReady = true;
-        } catch (err) {
-          console.warn("OCR 초기화 실패(폴백 모드 동작):", err);
-          state.ocrReady = false;
-        }
+      /* ==============================================================
+       * 3. 층 이동 규칙
+       * ============================================================== */
+      const isGamblePoint = f => f > 0 && f < MAX_FLOOR && f % 10 === 0;
+      const stageOf = f => Math.floor(Math.min(MAX_FLOOR, Math.max(0, f)) / 10);
+      const capTop = f => Math.min(MAX_FLOOR, f);
+      const floorText = f => (f === 0 ? "로비" : `${f}층`);
+      const pct = x => (x * 100).toFixed(0);
+
+      function sideDensity(f, x) {
+        let c = 0;
+        for (let k = SIDE_MIN; k <= SIDE_MAX; k++) if (capTop(f + k) === x) c++;
+        return c / (SIDE_MAX - SIDE_MIN + 1);
+      }
+      function grandDensity(f, x) {
+        let c = 0;
+        for (let k = GRAND_MIN; k <= GRAND_MAX; k++) if (capTop(f + k) === x) c++;
+        return c / (GRAND_MAX - GRAND_MIN + 1);
+      }
+      function ascentDensity(f, x) {
+        const d = f - x;
+        return d >= ASCENT_MIN && d <= ASCENT_MAX ? 1 / (ASCENT_MAX - ASCENT_MIN + 1) : 0;
+      }
+      // 한 번의 강하로 실제 가능한 이동인지 (새 입장·화면 전환·오인식은 기록하지 않음)
+      function isPossibleMove(before, after) {
+        if (!Number.isInteger(before) || !Number.isInteger(after)) return false;
+        if (before < 0 || before >= MAX_FLOOR || after < 0 || after > MAX_FLOOR) return false;
+        if (sideDensity(before, after) > 0) return true;
+        return isGamblePoint(before) && (grandDensity(before, after) > 0 || ascentDensity(before, after) > 0);
       }
 
+      /* ==============================================================
+       * 4. 기록 저장 (내 기기 + Supabase)
+       * ============================================================== */
       function loadRecords() {
         try {
-          const raw = localStorage.getItem(STORAGE_KEY);
-          const parsed = raw ? JSON.parse(raw) : [];
+          const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
           return Array.isArray(parsed) ? parsed : [];
         } catch {
           return [];
         }
       }
 
-      function getMyRecords() {
-        return state.records.filter(r => r.userId === state.userId);
-      }
-
-      function isSupabaseConfigured() {
-        return Boolean(
-          EXTERNAL_DB_CONFIG.supabaseUrl &&
-          EXTERNAL_DB_CONFIG.supabaseAnonKey &&
-          EXTERNAL_DB_CONFIG.supabaseTable
-        );
-      }
-
-      async function pushRecordToExternalDb(record) {
-        if (!isSupabaseConfigured() && !EXTERNAL_DB_CONFIG.customPostUrl) return;
-
-        if (isSupabaseConfigured()) {
-          const baseUrl = EXTERNAL_DB_CONFIG.supabaseUrl.replace(/\/+$/, "");
-          const table = encodeURIComponent(EXTERNAL_DB_CONFIG.supabaseTable);
-          const endpoint = `${baseUrl}/rest/v1/${table}`;
-          try {
-            const res = await fetch(endpoint, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "apikey": EXTERNAL_DB_CONFIG.supabaseAnonKey,
-                "Authorization": `Bearer ${EXTERNAL_DB_CONFIG.supabaseAnonKey}`,
-                "Prefer": "return=minimal"
-              },
-              body: JSON.stringify({
-                user_id: record.userId,
-                recorded_at: new Date(record.ts).toISOString(),
-                floor: record.floor,
-                delta: record.delta,
-                direction: record.direction,
-                key_type: record.keyType,
-                grade: record.grade,
-                remaining_turns: record.remainingTurns,
-                gamble: record.gamble
-              })
-            });
-            if (!res.ok) {
-              console.warn("Supabase 저장 응답 오류:", res.status);
-            }
-          } catch (err) {
-            console.warn("Supabase 네트워크 전송 실패:", err);
-          }
-        }
-
-        if (EXTERNAL_DB_CONFIG.customPostUrl) {
-          try {
-            await fetch(EXTERNAL_DB_CONFIG.customPostUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(record)
-            });
-          } catch (err) {
-            console.warn("외부 엔드포인트 전송 실패:", err);
-          }
-        }
-      }
-
       function saveRecords() {
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(state.records));
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state.records.slice(-3000)));
         } catch (e) {
           console.warn("localStorage 저장 실패:", e);
         }
         updateRecordCounter();
       }
 
+      function getMyRecords() {
+        return state.records.filter(r => r.userId === state.userId);
+      }
+
       function updateRecordCounter() {
-        if (el.recordCountText) {
-          const myCount = getMyRecords().length;
-          el.recordCountText.textContent = `내 기록: ${myCount}건 (ID: ${state.userId})`;
+        el.recordCountText.textContent = `내 기록: ${getMyRecords().length}건 (ID: ${state.userId})`;
+      }
+
+      function isSupabaseConfigured() {
+        return Boolean(EXTERNAL_DB_CONFIG.supabaseUrl && EXTERNAL_DB_CONFIG.supabaseAnonKey && EXTERNAL_DB_CONFIG.supabaseTable);
+      }
+
+      function dbEndpoint() {
+        const baseUrl = EXTERNAL_DB_CONFIG.supabaseUrl.replace(/\/+$/, "");
+        return `${baseUrl}/rest/v1/${encodeURIComponent(EXTERNAL_DB_CONFIG.supabaseTable)}`;
+      }
+
+      function dbHeaders(extra) {
+        // publishable 키(sb_publishable_...)는 JWT가 아니므로 apikey 헤더에만 넣습니다.
+        const headers = Object.assign({ apikey: EXTERNAL_DB_CONFIG.supabaseAnonKey }, extra || {});
+        if (!EXTERNAL_DB_CONFIG.supabaseAnonKey.startsWith("sb_")) {
+          headers.Authorization = `Bearer ${EXTERNAL_DB_CONFIG.supabaseAnonKey}`;
         }
+        return headers;
+      }
+
+      /* 기존 테이블 컬럼을 그대로 사용합니다.
+       * floor = 도착 층, delta = 도착 층 - 출발 층(상승이면 음수),
+       * direction = 출발 층에서 사이트가 추천했던 방향, remaining_turns = 출발 시 남은 강하 횟수,
+       * gamble = 출발 층이 가운데가 나오는 10층 단위 층이었는지 */
+      function toDbRow(r) {
+        return {
+          user_id: r.userId,
+          recorded_at: new Date(r.ts).toISOString(),
+          floor: r.floorAfter,
+          delta: r.floorAfter - r.floorBefore,
+          direction: r.direction,
+          remaining_turns: r.remainingTurns,
+          gamble: r.gamble
+        };
+      }
+
+      function fromDbRow(row) {
+        const floorAfter = Number(row.floor);
+        const delta = Number(row.delta);
+        return {
+          userId: row.user_id,
+          ts: Date.parse(row.recorded_at),
+          floorBefore: floorAfter - delta,
+          floorAfter,
+          direction: row.direction,
+          remainingTurns: row.remaining_turns,
+          gamble: Boolean(row.gamble),
+          synced: true
+        };
+      }
+
+      async function pushRecordToExternalDb(record) {
+        const key = `${record.userId}|${record.ts}`;
+        if (state.inFlight.has(key)) return false;
+        state.inFlight.add(key);
+        let ok = false;
+        if (isSupabaseConfigured()) {
+          try {
+            const res = await fetch(dbEndpoint(), {
+              method: "POST",
+              headers: dbHeaders({ "Content-Type": "application/json", Prefer: "return=minimal" }),
+              body: JSON.stringify(toDbRow(record))
+            });
+            ok = res.ok;
+            state.dbStatus = res.ok ? "저장 완료" : `저장 실패 (${res.status})`;
+            if (!res.ok) console.warn("Supabase 저장 응답 오류:", res.status, await res.text().catch(() => ""));
+          } catch (err) {
+            state.dbStatus = "저장 실패 (네트워크)";
+            console.warn("Supabase 네트워크 전송 실패:", err);
+          }
+        }
+        if (EXTERNAL_DB_CONFIG.customPostUrl) {
+          try {
+            await fetch(EXTERNAL_DB_CONFIG.customPostUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(toDbRow(record))
+            });
+          } catch (err) {
+            console.warn("외부 엔드포인트 전송 실패:", err);
+          }
+        }
+        state.inFlight.delete(key);
+        if (ok) {
+          record.synced = true;
+          saveRecords();
+          if (state.remote) state.remote.push(Object.assign({}, record));
+        }
+        render();
+        return ok;
+      }
+
+      // 저장에 실패했던 내 기록 재전송
+      async function retryUnsynced() {
+        if (!isSupabaseConfigured()) return;
+        const pending = state.records.filter(r => r.userId === state.userId && !r.synced).slice(0, 20);
+        for (const r of pending) {
+          const ok = await pushRecordToExternalDb(r);
+          if (!ok) break;
+        }
+      }
+
+      async function fetchRemoteRecords() {
+        if (!isSupabaseConfigured()) return;
+        const rows = [];
+        try {
+          for (let page = 0; page < REMOTE_MAX_PAGES; page++) {
+            const q = new URLSearchParams({
+              select: "user_id,recorded_at,floor,delta,direction,remaining_turns,gamble",
+              recorded_at: `gte.${DATA_SINCE}`,
+              order: "recorded_at.desc",
+              limit: String(REMOTE_PAGE_SIZE),
+              offset: String(page * REMOTE_PAGE_SIZE)
+            });
+            const res = await fetch(`${dbEndpoint()}?${q.toString()}`, { headers: dbHeaders() });
+            if (!res.ok) {
+              state.dbStatus = `읽기 실패 (${res.status}) — 내 기기 기록만 사용`;
+              state.remote = null;
+              refreshRecommendation(false);
+              return;
+            }
+            const chunk = await res.json();
+            rows.push(...chunk);
+            if (chunk.length < REMOTE_PAGE_SIZE) break;
+          }
+          state.remote = rows
+            .map(fromDbRow)
+            .filter(r => ["left", "center", "right"].includes(r.direction) && isPossibleMove(r.floorBefore, r.floorAfter));
+          state.dbStatus = `연결됨 · 수집 기록 ${state.remote.length}건 반영`;
+        } catch (err) {
+          state.dbStatus = "읽기 실패 (네트워크) — 내 기기 기록만 사용";
+          state.remote = null;
+        }
+        refreshRecommendation(false);
+        retryUnsynced();
+      }
+
+      // 서버 기록 + 아직 서버에 없는 내 기기 기록
+      function allRecords() {
+        const local = state.records.filter(r => isPossibleMove(r.floorBefore, r.floorAfter));
+        if (!state.remote) return local;
+        const seen = new Set(state.remote.map(r => `${r.userId}|${r.ts}`));
+        return state.remote.concat(local.filter(r => !seen.has(`${r.userId}|${r.ts}`)));
+      }
+
+      function appendMoveRecord(move) {
+        const record = Object.assign({ userId: state.userId, ts: Date.now(), synced: false }, move);
+        state.records.push(record);
+        if (state.records.length > 3000) state.records.shift();
+        saveRecords();
+        pushRecordToExternalDb(record);
+      }
+
+      /* ==============================================================
+       * 5. 수집 데이터 분석
+       * ============================================================== */
+
+      /* 가운데의 '대강하' 비율 추정.
+       * 화면만으로는 사용자가 실제로 어느 방향으로 갔는지 알 수 없으므로,
+       * 10층 단위 층에서 출발한 이동을 '좌/우(1~20층 균등) + 가운데(대강하 15~20 / 상승 1~5)'의 혼합으로 보고
+       * 대강하 비율 p를 베이즈 격자 계산으로 추정합니다. (상승은 가운데에서만 나오므로 p를 구분할 수 있습니다.)
+       * 사이트가 가운데를 추천했던 출발과 좌/우를 추천했던 출발은 실제로 가운데를 고른 비율이 다르므로 따로 계산하고,
+       * '아무도 가운데를 안 고른 경우'도 함께 고려해, 가운데 데이터가 없을 때는 p를 모르는 상태(기본값)로 둡니다. */
+      function estimateGrandRate(records) {
+        const G = 60;
+        const groups = { center: new Map(), side: new Map() };
+        let n = 0;
+        let ascents = 0;
+        records.forEach(r => {
+          if (!isGamblePoint(r.floorBefore) || !isPossibleMove(r.floorBefore, r.floorAfter)) return;
+          const g = r.direction === "center" ? groups.center : groups.side;
+          const key = r.floorBefore * 1000 + r.floorAfter;
+          g.set(key, (g.get(key) || 0) + 1);
+          n++;
+          if (r.floorAfter < r.floorBefore) ascents++;
+        });
+
+        const logPost = new Float64Array(G); // p에 대한 균등 사전분포
+        [groups.center, groups.side].forEach(g => {
+          if (g.size === 0) return;
+          const obs = [];
+          g.forEach((cnt, key) => {
+            const f = Math.floor(key / 1000);
+            const x = key % 1000;
+            obs.push({ cnt, s: sideDensity(f, x), g: grandDensity(f, x), a: ascentDensity(f, x) });
+          });
+          // 가운데를 고른 사람이 없는 경우(q = 0)의 가능도
+          let ll0 = 0;
+          for (const o of obs) ll0 += o.s > 0 ? o.cnt * Math.log(o.s) : -Infinity;
+          const lls = new Float64Array(G);
+          for (let j = 0; j < G; j++) {
+            const p = (j + 0.5) / G;
+            let maxI = -Infinity;
+            for (let i = 0; i < G; i++) {
+              const q = (i + 0.5) / G; // 이 그룹에서 실제로 가운데를 고른 비율
+              let ll = 0;
+              for (const o of obs) ll += o.cnt * Math.log((1 - q) * o.s + q * (p * o.g + (1 - p) * o.a));
+              lls[i] = ll;
+              if (ll > maxI) maxI = ll;
+            }
+            let sum = 0;
+            for (let i = 0; i < G; i++) sum += Math.exp(lls[i] - maxI);
+            const slab = maxI + Math.log(sum / G);
+            const m = Math.max(ll0, slab);
+            logPost[j] += m + Math.log(0.5 * Math.exp(ll0 - m) + 0.5 * Math.exp(slab - m));
+          }
+        });
+
+        let maxL = -Infinity;
+        for (let j = 0; j < G; j++) if (logPost[j] > maxL) maxL = logPost[j];
+        const w = new Float64Array(G);
+        let tot = 0;
+        for (let j = 0; j < G; j++) {
+          w[j] = Math.exp(logPost[j] - maxL);
+          tot += w[j];
+        }
+        let m1 = 0, m2 = 0;
+        for (let j = 0; j < G; j++) {
+          const p = (j + 0.5) / G;
+          w[j] /= tot;
+          m1 += p * w[j];
+          m2 += p * p * w[j];
+        }
+        return {
+          mean: m1,
+          sd: Math.sqrt(Math.max(0, m2 - m1 * m1)),
+          n,
+          ascents,
+          // 추정 분포에서 p 하나를 뽑음 (불확실할수록 넓게 뽑힘)
+          sample() {
+            let u = Math.random();
+            for (let j = 0; j < G; j++) {
+              u -= w[j];
+              if (u <= 0) return (j + Math.random()) / G;
+            }
+            return (G - 0.5) / G;
+          }
+        };
+      }
+
+      /* 왼쪽/오른쪽 비교: 10층 단위가 아닌 층(가운데 없음)에서, 추천된 쪽별 평균 강하 층수 */
+      function analyzeSides(records) {
+        const s = { left: { n: 0, sum: 0 }, right: { n: 0, sum: 0 } };
+        records.forEach(r => {
+          if (r.direction !== "left" && r.direction !== "right") return;
+          if (isGamblePoint(r.floorBefore) || r.floorBefore > MAX_FLOOR - SIDE_MAX) return; // 100층 제한에 잘리는 구간 제외
+          const d = r.floorAfter - r.floorBefore;
+          if (d < SIDE_MIN || d > SIDE_MAX) return;
+          s[r.direction].n++;
+          s[r.direction].sum += d;
+        });
+        ["left", "right"].forEach(k => {
+          const a = s[k];
+          a.raw = a.n ? a.sum / a.n : null;
+          a.mean = (SIDE_PRIOR_N * SIDE_PRIOR_MEAN + a.sum) / (SIDE_PRIOR_N + a.n);
+          a.sd = SIDE_SD / Math.sqrt(SIDE_PRIOR_N + a.n);
+        });
+        const z = (s.left.mean - s.right.mean) / Math.sqrt(s.left.sd ** 2 + s.right.sd ** 2);
+        s.better = Math.abs(z) >= SIDE_DIFF_Z ? (z > 0 ? "left" : "right") : null;
+        return s;
+      }
+
+      function randomNormal() {
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      }
+
+      // 데이터에 차이가 없으면 사실상 반반, 차이가 쌓이면 유리한 쪽으로 기울어지는 선택 (톰프슨 샘플링)
+      function pickSide(s) {
+        const l = s.left.mean + s.left.sd * randomNormal();
+        const r = s.right.mean + s.right.sd * randomNormal();
+        return l >= r ? "left" : "right";
+      }
+
+      /* 남은 강하 횟수 동안의 최종 보상 기대값(단계별 가치)을 최대화하는 계산 */
+      function makeSolver(pGrand) {
+        const memo = new Map();
+        const value = f => STAGE_VALUE[stageOf(f)];
+        function V(f, r) {
+          if (f >= MAX_FLOOR || r <= 0) return value(f);
+          const key = f * 64 + r;
+          const hit = memo.get(key);
+          if (hit !== undefined) return hit;
+          const q = Q(f, r);
+          const v = q.center === null ? q.side : Math.max(q.side, q.center);
+          memo.set(key, v);
+          return v;
+        }
+        function Q(f, r) {
+          let side = 0;
+          for (let k = SIDE_MIN; k <= SIDE_MAX; k++) side += V(capTop(f + k), r - 1);
+          side /= SIDE_MAX - SIDE_MIN + 1;
+          let center = null;
+          if (isGamblePoint(f)) {
+            let g = 0, a = 0;
+            for (let k = GRAND_MIN; k <= GRAND_MAX; k++) g += V(capTop(f + k), r - 1);
+            for (let k = ASCENT_MIN; k <= ASCENT_MAX; k++) a += V(f - k, r - 1);
+            center = pGrand * g / (GRAND_MAX - GRAND_MIN + 1) + (1 - pGrand) * a / (ASCENT_MAX - ASCENT_MIN + 1);
+          }
+          return { side, center };
+        }
+        return { V, Q };
+      }
+
+      // 가운데가 좌/우보다 이득이 되기 시작하는 대강하 비율
+      function breakEvenGrandRate(f, r) {
+        const diff = p => {
+          const q = makeSolver(p).Q(f, r);
+          return q.center - q.side;
+        };
+        if (diff(1) <= 0) return null;
+        if (diff(0) >= 0) return 0;
+        let lo = 0, hi = 1;
+        for (let i = 0; i < 25; i++) {
+          const mid = (lo + hi) / 2;
+          if (diff(mid) >= 0) hi = mid; else lo = mid;
+        }
+        return hi;
+      }
+
+      /* ==============================================================
+       * 6. 추천
+       * ============================================================== */
+      function refreshRecommendation(arrivedNewFloor) {
+        const f = state.floor;
+        const r = state.turns;
+        const rec = { active: false, direction: null, centerAvailable: false, floor: f, turns: r, headline: "", detail: "", cheer: "" };
+
+        if (f === null) {
+          rec.headline = state.stream ? "HUD에서 현재 층수를 읽는 중입니다" : "공유를 시작하면 자동으로 추천합니다";
+          rec.detail = "좌측 상단 '지하 N층' 및 '강하 N회 가능' HUD를 자동으로 읽어 방향을 추천합니다.";
+          rec.cheer = "오늘도 대박 층수 노려봅시다!";
+          state.rec = rec;
+          render();
+          return;
+        }
+
+        if (f >= MAX_FLOOR || r === 0) {
+          rec.headline = f >= MAX_FLOOR ? "100층 도달! 강하 완료" : "강하 횟수를 모두 사용했습니다";
+          rec.detail = `최종 ${floorText(f)} · 보상 ${stageOf(f)}단계. 다음 열쇠로 입장하면 자동으로 다시 추천합니다.`;
+          rec.cheer = "수고하셨습니다! 다음 열쇠도 대박 층수 노려봅시다!";
+          state.rec = rec;
+          render();
+          return;
+        }
+
+        const turnsForCalc = r === null ? 3 : r;
+        const data = allRecords();
+        const sides = analyzeSides(data);
+        if (arrivedNewFloor || !state.sideChoice) {
+          state.sideChoice = pickSide(sides);
+          state.pSample = null;
+          state.cheerIndex = Math.floor(Math.random() * 3);
+        }
+
+        rec.active = true;
+        rec.direction = state.sideChoice;
+        rec.centerAvailable = isGamblePoint(f) && !state.abyss;
+
+        const sideStatOf = (name, a) => (a.n ? `${name} ${a.n}건 평균 +${a.raw.toFixed(1)}층` : `${name} 기록 없음`);
+        const sideStat = (sides.left.n + sides.right.n) > 0
+          ? ` (${sideStatOf("왼쪽", sides.left)} / ${sideStatOf("오른쪽", sides.right)})`
+          : "";
+        const sideText = sides.better && sides.better === rec.direction
+          ? `수집 데이터에서 '${LABEL[sides.better]}'이 평균적으로 더 깊이 내려갔습니다${sideStat}.`
+          : `왼쪽·오른쪽은 확률이 같습니다(1~20층 무작위). 수집 데이터에서도 차이가 없어 둘 중 하나를 골랐습니다${sideStat}.`;
+        const turnsNote = r === null ? " (남은 강하 횟수를 못 읽어 3회로 계산)" : "";
+
+        if (rec.centerAvailable) {
+          const grand = estimateGrandRate(data);
+          if (state.pSample === null) state.pSample = EXPLORE_CENTER ? grand.sample() : grand.mean;
+          const qMean = makeSolver(grand.mean).Q(f, turnsForCalc);
+          const qPick = makeSolver(state.pSample).Q(f, turnsForCalc);
+          const be = breakEvenGrandRate(f, turnsForCalc);
+          const meanSaysCenter = qMean.center > qMean.side;
+          const pickCenter = qPick.center > qPick.side;
+          const gain = (qMean.center / qMean.side - 1) * 100;
+          const pText = grand.n > 0
+            ? `${pct(grand.mean)}%(±${pct(grand.sd)}%p, 10층 단위 기록 ${grand.n}건)`
+            : "50%(데이터 없음, 기본값)";
+          const base = be === null
+            ? `가운데(대강하 15~20층 / 상승 1~5층)는 지금 남은 횟수로는 대강하 비율이 100%여도 불리합니다${turnsNote}.`
+            : `가운데(대강하 15~20층 / 상승 1~5층)는 대강하 비율이 ${pct(be)}% 이상이면 유리합니다${turnsNote}.`;
+          if (pickCenter) {
+            rec.direction = "center";
+            rec.detail = meanSaysCenter
+              ? `${base} 수집 데이터 추정 ${pText} → 기대 보상이 좌/우보다 약 ${gain.toFixed(0)}% 높아 가운데를 추천합니다.`
+              : `${base} 추정 ${pText}로 아직 불확실해, 데이터를 모으기 위해 이번엔 가운데를 추천합니다.`;
+          } else {
+            rec.detail = meanSaysCenter
+              ? `${base} 추정 ${pText}로 아직 불확실해 이번엔 좌/우를 추천합니다.`
+              : `${base} 수집 데이터 추정 ${pText} → 좌/우가 기대 보상이 약 ${(-gain).toFixed(0)}% 높습니다.`;
+          }
+        } else {
+          rec.detail = sideText;
+        }
+
+        rec.headline = `지금은 '${LABEL[rec.direction]}' 추천`;
+        rec.cheer = CHEER_MESSAGES[rec.direction][state.cheerIndex % 3];
+        state.rec = rec;
+        render();
+      }
+
+      /* ==============================================================
+       * 7. 화면 갱신
+       * ============================================================== */
+      function render() {
+        const rec = state.rec;
+        if (!rec) return;
+
+        el.floorDisplay.textContent = state.floor === null ? "-층" : floorText(state.floor);
+        el.turnsDisplay.textContent = state.turns === null ? "-회" : `${state.turns}회`;
+
+        ["left", "center", "right"].forEach(dir => {
+          const card = el.cards[dir];
+          card.classList.remove("active", "center-gamble");
+          let tag;
+          if (!rec.active) {
+            tag = "대기";
+          } else if (dir === rec.direction) {
+            card.classList.add("active");
+            if (dir === "center") card.classList.add("center-gamble");
+            tag = "추천 선택";
+          } else if (dir === "center") {
+            tag = rec.centerAvailable ? "비추천" : "10층 단위만 등장";
+          } else {
+            tag = rec.direction === "center" ? "비추천" : "확률 동일";
+          }
+          el.subs[dir].textContent = tag;
+        });
+
+        el.recHeadline.textContent = rec.headline;
+        el.recDetail.textContent = rec.detail;
+        el.cheerText.textContent = rec.cheer;
+
+        el.stateSummary.textContent = state.stream
+          ? `HUD 자동 인식 중 · 수집 데이터 ${allRecords().length}건 반영`
+          : "좌측 상단 HUD 자동 인식 대기";
+
+        const rf = state.read.floor;
+        const checking = rf.value !== null && rf.value !== state.floor && rf.hits < STABLE_READS
+          ? ` · 확인 중 ${floorText(rf.value)} (${rf.hits}/${STABLE_READS})`
+          : "";
+        if (state.ocrReady) {
+          el.hudReadStatus.textContent = `HUD 인식: ${state.floor === null ? "-" : floorText(state.floor)} · 강하 ${state.turns === null ? "-" : state.turns}회${checking}`;
+        }
+        el.dbStatus.textContent = `데이터 서버: ${state.dbStatus}`;
+        updateRecordCounter();
       }
 
       function setErrorState(title, detail) {
-        if (el.liveDot) {
-          el.liveDot.classList.remove("live");
-          el.liveDot.classList.add("error");
-        }
-        if (el.statusText) el.statusText.textContent = "공유 오류/제한됨";
-        if (el.recHeadline) el.recHeadline.textContent = title;
-        if (el.recDetail) el.recDetail.textContent = detail;
+        el.liveDot.classList.remove("live");
+        el.liveDot.classList.add("error");
+        el.statusText.textContent = "공유 오류/제한됨";
+        el.recHeadline.textContent = title;
+        el.recDetail.textContent = detail;
       }
 
-      function hasMeaningfulSceneChange(ctx, w, h) {
-        const img = ctx.getImageData(0, 0, w, h).data;
-        const sampled = [];
-        for (let i = 0; i < img.length; i += 32) {
-          sampled.push(img[i], img[i + 1], img[i + 2]);
-        }
-
-        if (!state.lastSamplePixels || state.lastSamplePixels.length !== sampled.length) {
-          state.lastSamplePixels = sampled;
-          return true;
-        }
-
-        let changedChannels = 0;
-        for (let i = 0; i < sampled.length; i += 3) {
-          const dr = Math.abs(sampled[i] - state.lastSamplePixels[i]);
-          const dg = Math.abs(sampled[i + 1] - state.lastSamplePixels[i + 1]);
-          const db = Math.abs(sampled[i + 2] - state.lastSamplePixels[i + 2]);
-          if (dr + dg + db > 40) {
-            changedChannels++;
+      /* ==============================================================
+       * 8. HUD 판독 ('지하 N층', '강하 N회 가능')
+       * ============================================================== */
+      async function initOcr() {
+        if (state.ocrReady || state.ocrWorker || !window.Tesseract) {
+          if (!window.Tesseract) {
+            state.ocrFailed = true;
+            el.hudReadStatus.textContent = "HUD 인식: OCR 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
           }
+          return;
         }
-
-        const totalPixels = sampled.length / 3;
-        const diffRatio = changedChannels / totalPixels;
-        if (diffRatio < MIN_SCENE_DIFF_RATIO) {
-          return false;
+        try {
+          el.hudReadStatus.textContent = "HUD 인식: OCR 엔진 불러오는 중…";
+          state.ocrWorker = await window.Tesseract.createWorker("kor+eng", 1, { logger: () => {} });
+          await state.ocrWorker.setParameters({
+            tessedit_pageseg_mode: window.Tesseract.PSM.SPARSE_TEXT
+          });
+          state.ocrReady = true;
+          el.hudReadStatus.textContent = "HUD 인식: 준비 완료";
+        } catch (err) {
+          console.warn("OCR 초기화 실패:", err);
+          state.ocrWorker = null;
+          state.ocrFailed = true;
+          el.hudReadStatus.textContent = "HUD 인식: OCR 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
         }
-
-        state.lastSamplePixels = sampled;
-        return true;
       }
 
-      function prepareHighContrastHudCrop(videoEl, hudCanvasEl) {
+      function prepareHighContrastHudCrop() {
+        const videoEl = el.video;
         const vw = videoEl.videoWidth || 1280;
         const vh = videoEl.videoHeight || 720;
-        // 좌측 상단 HUD ('지하 15층', '강하 3회 가능') 영역 크롭 및 확대
+        // 좌측 상단 HUD ('지하 27층', '강하 3회 가능') 영역 크롭 및 확대 (비율 유지)
         const sx = Math.floor(vw * 0.005);
-        const sy = Math.floor(vh * 0.02);
-        const sw = Math.floor(vw * 0.16);
-        const sh = Math.floor(vh * 0.27);
+        const sy = Math.floor(vh * 0.025);
+        const sw = Math.floor(vw * 0.15);
+        const sh = Math.floor(vh * 0.22);
+        const targetW = 600;
+        const targetH = Math.max(120, Math.round(targetW * sh / sw));
 
-        const targetW = 480;
-        const targetH = 320;
-        hudCanvasEl.width = targetW;
-        hudCanvasEl.height = targetH;
-
-        const hctx = hudCanvasEl.getContext("2d");
+        const c = el.hudCanvas;
+        c.width = targetW;
+        c.height = targetH;
+        const hctx = c.getContext("2d", { willReadFrequently: true });
         hctx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, targetW, targetH);
 
         const imgData = hctx.getImageData(0, 0, targetW, targetH);
         const d = imgData.data;
-        // 밝은 글씨(층수/횟수) 대비를 높여 OCR 인식률 향상
-        for (let i = 0; i < d.length; i += 4) {
-          const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-          const boosted = lum > 135 ? 255 : (lum < 65 ? 0 : Math.min(255, Math.max(0, (lum - 65) * 3.6)));
-          d[i] = boosted;
-          d[i + 1] = boosted;
-          d[i + 2] = boosted;
+        const bits = new Uint8Array(targetW * targetH);
+        // 밝은 글씨(흰색/금색)만 남겨 흰 바탕 검은 글씨로 변환 (OCR이 더 잘 읽는 형태)
+        for (let y = 0; y < targetH; y++) {
+          for (let x = 0; x < targetW; x++) {
+            const i = (y * targetW + x) * 4;
+            const bright = Math.max(d[i], d[i + 1], d[i + 2]) >= 150;
+            const val = bright ? 0 : 255;
+            d[i] = val;
+            d[i + 1] = val;
+            d[i + 2] = val;
+            d[i + 3] = 255;
+            bits[y * targetW + x] = bright ? 1 : 0;
+          }
         }
         hctx.putImageData(imgData, 0, 0);
-        return hudCanvasEl;
+
+        const pctx = el.hudPreviewCanvas.getContext("2d");
+        pctx.clearRect(0, 0, el.hudPreviewCanvas.width, el.hudPreviewCanvas.height);
+        pctx.drawImage(c, 0, 0, el.hudPreviewCanvas.width, el.hudPreviewCanvas.height);
+        return { canvas: c, bits };
       }
 
-      function parseFloorFromOcrText(rawText) {
-        if (!rawText) return null;
-        const normalized = rawText.replace(/\s+/g, " ");
-        // '지하 15층', '15층', '15 층' 패턴 우선 추출
-        const floorMatch = normalized.match(/(?:지하\s*)?(\d{1,3})\s*층/);
-        if (floorMatch) {
-          const n = parseInt(floorMatch[1], 10);
-          if (n >= 1 && n <= 100) return n;
-        }
-        return null;
+      function countBitDiff(a, b) {
+        if (!a || !b || a.length !== b.length) return Infinity;
+        let diff = 0;
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++;
+        return diff;
       }
 
-      function parseTurnsFromOcrText(rawText) {
-        if (!rawText) return null;
-        const normalized = rawText.replace(/\s+/g, " ");
-        const turnMatch = normalized.match(/강하\s*(\d)\s*회/);
-        if (turnMatch) {
-          const t = parseInt(turnMatch[1], 10);
-          if (t >= 0 && t <= 6) return t;
+      function parseHudText(rawText) {
+        const text = (rawText || "").replace(/\s+/g, " ").trim();
+        let floor = null;
+        if (/로\s?비/.test(text)) floor = 0;
+        const fm = text.match(/(?:지\s?하\s*)?(\d{1,3})\s*[층충총증]/);
+        if (fm) {
+          const n = parseInt(fm[1], 10);
+          if (n >= 1 && n <= MAX_FLOOR) floor = n;
         }
-        return null;
+        let turns = null;
+        const tm = text.match(/강\s?하\s*(\d{1,2})\s*[회희화외]/) || text.match(/(\d{1,2})\s*[회희화외]\s*가\s?능/);
+        if (tm) {
+          const t = parseInt(tm[1], 10);
+          if (t >= 0 && t <= 12) turns = t;
+        }
+        return { floor, turns, abyss: /나\s?락|부\s?활/.test(text), raw: text.slice(0, 40) };
       }
 
-      async function detectGameContext(ctx, w, h, videoEl) {
-        const keyBadgeArea = ctx.getImageData(
-          Math.floor(w * 0.01),
-          Math.floor(h * 0.04),
-          Math.floor(w * 0.15),
-          Math.floor(h * 0.20)
-        ).data;
-        const centerMsg = ctx.getImageData(
-          Math.floor(w * 0.32),
-          Math.floor(h * 0.62),
-          Math.floor(w * 0.36),
-          Math.floor(h * 0.16)
-        ).data;
-
-        let crimsonCount = 0;
-        let frostBlueCount = 0;
-        let legendGoldCount = 0;
-        let rareBlueCount = 0;
-
-        for (let i = 0; i < keyBadgeArea.length; i += 12) {
-          const r = keyBadgeArea[i];
-          const g = keyBadgeArea[i + 1];
-          const b = keyBadgeArea[i + 2];
-          if (r > 195 && g < 95 && b < 95) crimsonCount++;
-          if (b > 195 && r < 120 && g > 130) frostBlueCount++;
-          if (r > 205 && g > 155 && b < 70) legendGoldCount++;
-          if (b > 185 && r < 100 && g < 160) rareBlueCount++;
+      // 같은 값이 STABLE_READS번 읽혀야 확정 (못 읽은 프레임은 건너뜀)
+      function stabilize(slot, value) {
+        const s = state.read[slot];
+        if (value === null) return null;
+        if (s.value === value) s.hits++;
+        else {
+          s.value = value;
+          s.hits = 1;
         }
-
-        let detectedKeyType = state.keyType;
-        if (crimsonCount > frostBlueCount && crimsonCount > 18) {
-          detectedKeyType = "abyss_flame";
-        } else if (frostBlueCount > crimsonCount && frostBlueCount > 18) {
-          detectedKeyType = "abyss_frost";
-        } else if (crimsonCount <= 12 && frostBlueCount <= 12 && state.lastTurn === 0) {
-          detectedKeyType = "hell";
-        }
-
-        let detectedGrade = state.grade;
-        if (legendGoldCount > 35) {
-          detectedGrade = "legend";
-        } else if (rareBlueCount > 35) {
-          detectedGrade = "rare";
-        } else if (state.lastTurn === 0) {
-          detectedGrade = "hero";
-        }
-
-        let centerGold = 0;
-        for (let i = 0; i < centerMsg.length; i += 16) {
-          if (centerMsg[i] > 190 && centerMsg[i + 1] > 150 && centerMsg[i + 2] < 110) centerGold++;
-        }
-        const hasGambleAlert = centerGold > 25;
-
-        let ocrFloor = null;
-        let ocrTurns = null;
-        let ocrTextSnippet = "";
-
-        if (state.ocrReady && state.ocrWorker && videoEl) {
-          try {
-            const processedHud = prepareHighContrastHudCrop(videoEl, el.hudCanvas);
-            const { data } = await state.ocrWorker.recognize(processedHud);
-            ocrTextSnippet = (data && data.text ? data.text : "").replace(/\s+/g, " ").trim().slice(0, 30);
-            ocrFloor = parseFloorFromOcrText(data && data.text ? data.text : "");
-            ocrTurns = parseTurnsFromOcrText(data && data.text ? data.text : "");
-          } catch (err) {
-            console.warn("OCR 인식 중 오류:", err);
-          }
-        }
-
-        let resolvedFloor;
-        let floorSource = "추정";
-        if (ocrFloor !== null) {
-          resolvedFloor = ocrFloor;
-          floorSource = "HUD 인식";
-        } else if (state.lastFloor !== null) {
-          // OCR이 잠깐 못 읽었을 때는 이전 층수에서 과도하게 튀지 않게 완만히 유지/진행
-          resolvedFloor = Math.min(100, Math.max(1, state.lastFloor + 5));
-          floorSource = "연속 보간";
-        } else {
-          resolvedFloor = 15;
-          floorSource = "초기값";
-        }
-
-        let activeRemaining;
-        if (ocrTurns !== null) {
-          activeRemaining = ocrTurns;
-        } else if (state.lastTurn === 0) {
-          activeRemaining = detectedGrade === "legend" ? 4 : 3;
-        } else {
-          activeRemaining = state.remainingTurns;
-        }
-
-        state.keyType = detectedKeyType;
-        state.grade = detectedGrade;
-        state.remainingTurns = activeRemaining;
-
-        return {
-          floor: resolvedFloor,
-          floorSource,
-          ocrTextSnippet,
-          hasGambleAlert,
-          remainingAtTurn: activeRemaining
-        };
+        return s.hits >= STABLE_READS ? value : null;
       }
 
-      function scoreDirection(direction, ctxInfo) {
-        let score = 50;
-        const myRecs = getMyRecords();
-        const exactMatching = myRecs.filter(
-          r => r.direction === direction && r.keyType === state.keyType && r.grade === state.grade
-        );
-        const keyMatching = myRecs.filter(
-          r => r.direction === direction && r.keyType === state.keyType
-        );
-        const fallbackMatching = exactMatching.length > 0
-          ? exactMatching
-          : (keyMatching.length > 0
-            ? keyMatching
-            : myRecs.filter(r => r.direction === direction));
-
-        if (fallbackMatching.length > 0) {
-          const avgDelta = fallbackMatching.reduce((acc, item) => acc + (item.delta || 10), 0) / fallbackMatching.length;
-          score += (avgDelta - 10) * 1.5;
-        }
-
-        const recentSameDir = myRecs.slice(-3).filter(r => r.direction === direction).length;
-        score -= recentSameDir * 4;
-
-        if (direction === "center") {
-          if (ctxInfo.hasGambleAlert || ctxInfo.floor % 20 === 0 || state.lastTurn % 4 === 2) {
-            score += 14;
-          } else {
-            score -= 10;
-          }
-        } else if (direction === "left") {
-          const leftTargetFloor = ctxInfo.floor + 10;
-          if (state.keyType === "abyss_flame") {
-            score += leftTargetFloor % 2 === 0 ? 7 : -5;
-          } else if (state.keyType === "abyss_frost") {
-            score += leftTargetFloor % 2 === 1 ? 7 : -5;
-          } else {
-            score += ctxInfo.floor < 45 ? 5 : 1;
-          }
-        } else if (direction === "right") {
-          const rightTargetFloor = ctxInfo.floor + 13;
-          if (state.keyType === "abyss_flame") {
-            score += rightTargetFloor % 2 === 0 ? 8 : -5;
-          } else if (state.keyType === "abyss_frost") {
-            score += rightTargetFloor % 2 === 1 ? 8 : -5;
-          } else {
-            score += ctxInfo.floor >= 45 ? 6 : 2;
-          }
-          if (state.grade === "legend" && ctxInfo.remainingAtTurn <= 2) {
-            score += 4;
-          }
-        }
-
-        return Math.round(score);
+      function resetForNewRun() {
+        state.abyss = false;
+        state.abyssHits = 0;
+        state.sideChoice = null;
       }
 
-      function buildReasonText(bestDir, ctxInfo) {
-        const keyName = KEY_LABELS[state.keyType] || "지옥 열쇠";
-        const gradeName = GRADE_LABELS[state.grade] || "영웅";
-        const sameComboCount = getMyRecords().filter(
-          r => r.keyType === state.keyType && r.grade === state.grade
-        ).length;
-
-        if (bestDir === "center") {
-          return `[${state.userId}] ${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층(${ctxInfo.floorSource}) 변수 타이밍이라 '가운데'를 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
+      // 층이 확정적으로 바뀌었을 때: 실제 가능한 이동이면 기록하고 다음 추천
+      function onFloorConfirmed(newFloor) {
+        const prev = state.floor;
+        if (prev === newFloor) return;
+        const rec = state.rec;
+        if (prev !== null && rec && rec.active && rec.floor === prev && isPossibleMove(prev, newFloor)) {
+          appendMoveRecord({
+            floorBefore: prev,
+            floorAfter: newFloor,
+            direction: rec.direction,
+            remainingTurns: rec.turns,
+            gamble: isGamblePoint(prev)
+          });
         }
-        if (bestDir === "right") {
-          return `[${state.userId}] ${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층(${ctxInfo.floorSource}) 기준 더 깊은 층수와 생존 조건을 고려해 '오른쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
-        }
-        return `[${state.userId}] ${keyName} · ${gradeName} · 현재 ${ctxInfo.floor}층(${ctxInfo.floorSource}) 흐름과 열쇠 조건을 따져 안정적인 '왼쪽'을 골랐어요 (내 기록 ${sameComboCount}건 반영).`;
+        if (newFloor === 0) resetForNewRun();
+        state.floor = newFloor;
+        refreshRecommendation(true);
       }
 
-      function pickCheerText(bestDir) {
-        const list = CHEER_MESSAGES[bestDir] || CHEER_MESSAGES.left;
-        return list[state.lastTurn % list.length];
-      }
+      function applyHudReading(parsed) {
+        const floorC = stabilize("floor", parsed.floor);
+        const turnsC = stabilize("turns", parsed.turns);
 
-      function appendAutoRecord(direction, ctxInfo) {
-        const prevFloor = state.lastFloor ?? ctxInfo.floor;
-        const delta = Math.max(1, Math.abs(ctxInfo.floor - prevFloor) || 1);
-
-        const newRecord = {
-          userId: state.userId,
-          ts: Date.now(),
-          floor: ctxInfo.floor,
-          delta,
-          direction,
-          keyType: state.keyType,
-          grade: state.grade,
-          remainingTurns: ctxInfo.remainingAtTurn,
-          gamble: ctxInfo.hasGambleAlert
-        };
-        state.records.push(newRecord);
-        pushRecordToExternalDb(newRecord);
-
-        if (state.records.length > 600) {
-          state.records.shift();
+        if (parsed.abyss) state.abyssHits++;
+        if (!state.abyss && state.abyssHits >= STABLE_READS) {
+          state.abyss = true;
+          if (state.rec && state.rec.active) refreshRecommendation(false);
         }
 
-        state.lastFloor = ctxInfo.floor;
-        state.lastTurn += 1;
-        state.remainingTurns = Math.max(0, ctxInfo.remainingAtTurn - 1);
-        saveRecords();
-      }
-
-      function renderRecommendation(ctxInfo, scores, bestDir) {
-        ["left", "center", "right"].forEach(dir => {
-          const card = el.cards[dir];
-          if (!card) return;
-          card.classList.remove("active", "center-gamble");
-          el.subs[dir].textContent = `점수 ${scores[dir]}`;
-
-          if (dir === bestDir) {
-            card.classList.add("active");
-            if (dir === "center" && ctxInfo.hasGambleAlert) {
-              card.classList.add("center-gamble");
+        let needRefresh = false;
+        if (turnsC !== null && turnsC !== state.turns) {
+          const prevTurns = state.turns;
+          state.turns = turnsC;
+          if (prevTurns !== null && turnsC >= prevTurns + 2) {
+            // 남은 횟수가 크게 늘어남 = 새 열쇠로 입장 (로비)
+            resetForNewRun();
+            if (floorC === null) {
+              state.floor = 0;
+              refreshRecommendation(true);
             }
-            el.subs[dir].textContent = "추천 선택";
+          } else if (prevTurns === null || turnsC > prevTurns) {
+            needRefresh = true; // 처음 읽힘 또는 제단 효과로 횟수 증가
           }
-        });
-
-        const labelMap = { left: "왼쪽", center: "가운데", right: "오른쪽" };
-        const keyName = KEY_LABELS[state.keyType] || "지옥 열쇠";
-        const gradeName = GRADE_LABELS[state.grade] || "영웅";
-
-        if (el.floorDisplay) {
-          el.floorDisplay.textContent = `${ctxInfo.floor}층`;
+          // 1회 감소는 강하 진행 중이므로 층이 확정될 때 함께 처리
         }
-        el.recHeadline.textContent = `지금은 '${labelMap[bestDir]}' 추천`;
-        el.recDetail.textContent = buildReasonText(bestDir, ctxInfo);
-        if (el.cheerText) {
-          el.cheerText.textContent = pickCheerText(bestDir);
+
+        if (floorC !== null && floorC !== state.floor) {
+          onFloorConfirmed(floorC);
+        } else if (needRefresh) {
+          refreshRecommendation(false);
+        } else {
+          render();
         }
-        el.stateSummary.textContent = `${keyName} · ${gradeName} · 남은 ${ctxInfo.remainingAtTurn}회 · ${ctxInfo.floorSource}`;
       }
 
       async function captureTick() {
         if (state.isBusy || !state.stream || !el.video || el.video.readyState < 2) return;
+        if (!state.ocrReady) {
+          if (state.ocrFailed) el.hudReadStatus.textContent = "HUD 인식: OCR 엔진을 불러오지 못했습니다 (새로고침 후 다시 시도)";
+          return;
+        }
         state.isBusy = true;
-
         try {
-          const w = 640;
-          const h = 360;
-          el.canvas.width = w;
-          el.canvas.height = h;
-          const ctx = el.canvas.getContext("2d");
-          ctx.drawImage(el.video, 0, 0, w, h);
-
-          if (!hasMeaningfulSceneChange(ctx, w, h)) return;
-
-          const ctxInfo = await detectGameContext(ctx, w, h, el.video);
-          const scores = {
-            left: scoreDirection("left", ctxInfo),
-            center: scoreDirection("center", ctxInfo),
-            right: scoreDirection("right", ctxInfo)
-          };
-          const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
-
-          appendAutoRecord(bestDir, ctxInfo);
-          renderRecommendation(ctxInfo, scores, bestDir);
+          const crop = prepareHighContrastHudCrop();
+          let parsed;
+          if (state.lastParsed && countBitDiff(crop.bits, state.lastHudBits) < HUD_SAME_PIXELS) {
+            parsed = state.lastParsed; // HUD 변화 없음 → 직전 판독 결과 재사용
+          } else {
+            const { data } = await state.ocrWorker.recognize(crop.canvas);
+            parsed = parseHudText(data && data.text ? data.text : "");
+            state.lastParsed = parsed;
+            state.lastHudBits = crop.bits;
+          }
+          el.hudOcrText.textContent = `읽힌 글자: ${parsed.raw || "없음"}`;
+          applyHudReading(parsed);
+        } catch (err) {
+          console.warn("HUD 판독 중 오류:", err);
         } finally {
           state.isBusy = false;
         }
       }
 
+      /* ==============================================================
+       * 9. 화면 공유
+       * ============================================================== */
       async function startShare() {
         if (!window.isSecureContext) {
-          setErrorState(
-            "보안(HTTPS) 환경이 아닙니다",
-            "HTTPS로 서비스되는 독립 페이지에서 열어주세요."
-          );
+          setErrorState("보안(HTTPS) 환경이 아닙니다", "HTTPS로 서비스되는 독립 페이지에서 열어주세요.");
           return;
         }
-
         if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-          setErrorState(
-            "이 브라우저/프레임에서는 화면 공유가 차단되어 있습니다",
-            "독립 HTTPS 주소로 직접 열어주세요."
-          );
+          setErrorState("이 브라우저/프레임에서는 화면 공유가 차단되어 있습니다", "독립 HTTPS 주소로 직접 열어주세요.");
           return;
         }
 
         try {
           const stream = await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: { ideal: 15, max: 30 } },
+            video: { frameRate: { ideal: 5, max: 15 } },
             audio: false
           });
 
           state.stream = stream;
           el.video.srcObject = stream;
-          if (el.video.play) {
-            el.video.play().catch(() => {});
-          }
+          if (el.video.play) el.video.play().catch(() => {});
 
-          if (el.liveDot) {
-            el.liveDot.classList.remove("error");
-            el.liveDot.classList.add("live");
-          }
-          if (el.statusText) el.statusText.textContent = "자동 HUD 인식 중";
-          if (el.toggleShareBtn) el.toggleShareBtn.textContent = "공유 중지";
-
-          initOcr();
+          el.liveDot.classList.remove("error");
+          el.liveDot.classList.add("live");
+          el.statusText.textContent = "자동 HUD 인식 중";
+          el.toggleShareBtn.textContent = "공유 중지";
 
           const track = stream.getVideoTracks()[0];
-          if (track) {
-            track.addEventListener("ended", () => stopShare(false));
-          }
+          if (track) track.addEventListener("ended", () => stopShare(false));
 
           clearInterval(state.timerId);
-          state.timerId = setInterval(captureTick, CAPTURE_INTERVAL_MS);
-          setTimeout(captureTick, 900);
+          state.timerId = setInterval(captureTick, OCR_INTERVAL_MS);
+          refreshRecommendation(false);
+          initOcr();
         } catch (err) {
           const errName = err && err.name ? err.name : "Error";
           const errMsg = err && err.message ? err.message : "권한이 거부되었거나 차단되었습니다.";
@@ -934,50 +1277,35 @@
           });
           state.stream = null;
         }
+        el.video.srcObject = null;
+        state.read.floor = { value: null, hits: 0 };
+        state.read.turns = { value: null, hits: 0 };
+        state.lastParsed = null;
+        state.lastHudBits = null;
 
-        if (el.video) {
-          el.video.srcObject = null;
-        }
-        if (el.liveDot) {
-          el.liveDot.classList.remove("live");
-          if (!keepErrorDot) {
-            el.liveDot.classList.remove("error");
-          }
-        }
-        if (!keepErrorDot && el.statusText) {
-          el.statusText.textContent = "화면 공유 대기 중";
-        }
-        if (el.toggleShareBtn) {
-          el.toggleShareBtn.textContent = "화면 공유 시작";
-        }
+        el.liveDot.classList.remove("live");
+        if (!keepErrorDot) el.liveDot.classList.remove("error");
+        if (!keepErrorDot) el.statusText.textContent = "화면 공유 대기 중";
+        el.toggleShareBtn.textContent = "화면 공유 시작";
+        if (!keepErrorDot) render();
       }
 
-      if (el.toggleShareBtn) {
-        el.toggleShareBtn.addEventListener("click", () => {
-          if (state.stream) {
-            stopShare(false);
-          } else {
-            startShare();
-          }
-        });
-      }
+      el.toggleShareBtn.addEventListener("click", () => {
+        if (state.stream) stopShare(false);
+        else startShare();
+      });
 
-      if (el.resetRecordsBtn) {
-        el.resetRecordsBtn.addEventListener("click", () => {
-          state.records = state.records.filter(r => r.userId !== state.userId);
-          state.lastFloor = null;
-          state.lastTurn = 0;
-          state.lastSamplePixels = null;
-          state.remainingTurns = 3;
-          saveRecords();
-          if (el.floorDisplay) el.floorDisplay.textContent = "-층";
-          if (el.recHeadline) el.recHeadline.textContent = "내 기록이 초기화되었습니다";
-          if (el.recDetail) el.recDetail.textContent = "다시 공유를 시작하면 내 ID로 새 기록이 쌓입니다.";
-          if (el.cheerText) el.cheerText.textContent = "새 기록으로 다시 대박 층수 도전해 봅시다!";
-        });
-      }
+      el.resetRecordsBtn.addEventListener("click", () => {
+        state.records = state.records.filter(r => r.userId !== state.userId);
+        saveRecords();
+        el.recHeadline.textContent = "내 기록이 초기화되었습니다";
+        el.recDetail.textContent = "이 기기에 저장된 내 기록만 지웠습니다. 서버에 모인 데이터는 그대로 반영됩니다.";
+        el.cheerText.textContent = "새 기록으로 다시 대박 층수 도전해 봅시다!";
+      });
 
-      updateRecordCounter();
+      refreshRecommendation(false);
+      fetchRemoteRecords();
+      state.remoteTimerId = setInterval(fetchRemoteRecords, REMOTE_REFRESH_MS);
     })();
   </script>
 </body>
