@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>지옥 강하 추천기 (초단순 기록형)</title>
+  <style>
+    :root {
+      --bg: #0c0e14;
+      --card: #151924;
+      --border: #272e40;
+      --text: #f3f5fa;
+      --muted: #8f9bb3;
+      --accent: #4f8cff;
+      --gold: #f5b942;
+      --ok: #2ecc71;
+      --err: #ff6b6b;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .wrap {
+      width: 100%;
+      max-width: 540px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 18px;
+    }
+
+    .status-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .status-title {
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #64708a;
+      display: inline-block;
+    }
+
+    .dot.live {
+      background: var(--ok);
+      box-shadow: 0 0 8px var(--ok);
+    }
+
+    .dot.error {
+      background: var(--err);
+      box-shadow: 0 0 8px var(--err);
+    }
+
+    .meta-sub {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      border: 1px solid var(--border);
+      background: #1d2332;
+      color: var(--text);
+      padding: 10px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+
+    button:hover {
+      border-color: var(--accent);
+      background: #232b3e;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    button.primary:hover {
+      background: #3b7af5;
+    }
+
+    button.danger {
+      background: transparent;
+      color: var(--muted);
+      padding: 8px 12px;
+      font-size: 12px;
+    }
+
+    .direction-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+
+    .dir-card {
+      background: var(--card);
+      border: 2px solid var(--border);
+      border-radius: 20px;
+      padding: 28px 12px;
+      text-align: center;
+      transition: 0.2s ease;
+      opacity: 0.55;
+    }
+
+    .dir-card.active {
+      opacity: 1;
+      border-color: var(--accent);
+      background: linear-gradient(180deg, rgba(79, 140, 255, 0.22), var(--card));
+      transform: translateY(-3px);
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+    }
+
+    .dir-card.active.center-gamble {
+      border-color: var(--gold);
+      background: linear-gradient(180deg, rgba(245, 185, 66, 0.22), var(--card));
+    }
+
+    .dir-name {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+
+    .dir-tag {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .dir-card.active .dir-tag {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .summary-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .rec-headline {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .rec-detail {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    .footer-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+      padding: 0 4px;
+    }
+
+    .hidden-capture {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top-bar">
+      <div class="status-group">
+        <div class="status-title">
+          <span id="liveDot" class="dot"></span>
+          <span id="statusText">화면 공유 대기 중</span>
+        </div>
+        <div id="stateSummary" class="meta-sub">자동 열쇠·등급·횟수 인식 대기</div>
+      </div>
+      <div class="btn-row">
+        <button id="toggleShareBtn" class="primary" type="button">화면 공유 시작</button>
+      </div>
+    </div>
+
+    <div class="direction-grid">
+      <div id="card-left" class="dir-card">
+        <div class="dir-name">왼쪽</div>
+        <div id="sub-left" class="dir-tag">대기</div>
+      </div>
+      <div id="card-center" class="dir-card">
+        <div class="dir-name">가운데</div>
+        <div id="sub-center" class="dir-tag">대기</div>
+      </div>
+      <div id="card-right" class="dir-card">
+        <div class="dir-name">오른쪽</div>
+        <div id="sub-right" class="dir-tag">대기</div>
+      </div>
+    </div>
+
+    <div class="summary-card">
+      <div>
+        <div id="recHeadline" class="rec-headline">공유를 시작하면 자동으로 추천합니다</div>
+        <div id="recDetail" class="rec-detail">누적 기록을 바탕으로 방향 점수를 계산합니다.</div>
+      </div>
+    </div>
+
+    <div class="footer-bar">
+      <span id="recordCountText">누적 기록: 0건</span>
+      <button id="resetRecordsBtn" class="danger" type="button">기록 초기화</button>
+    </div>
+  </div>
+
+  <video id="hiddenVideo" class="hidden-capture" autoplay muted playsinline></video>
+  <canvas id="hiddenCanvas" class="hidden-capture"></canvas>
+
+  <script>
+    (function () {
+      const STORAGE_KEY = "hell_descent_simple_records_v1";
+      const CAPTURE_INTERVAL_MS = 3000;
+
+      const KEY_LABELS = {
+        hell: "지옥 열쇠",
+        abyss_flame: "나락의 화염 열쇠(짝수 생존)",
+        abyss_frost: "나락의 서리 열쇠(홀수 생존)"
+      };
+
+      const GRADE_LABELS = {
+        rare: "희귀",
+        hero: "영웅",
+        legend: "전설"
+      };
+
+      const state = {
+        stream: null,
+        timerId: null,
+        lastFrameSignature: "",
+        lastFloor: null,
+        lastTurn: 0,
+        keyType: "hell",
+        grade: "hero",
+        remainingTurns: 3,
+        records: loadRecords()
+      };
+
+      const el = {
+        liveDot: document.getElementById("liveDot"),
+        statusText: document.getElementById("statusText"),
+        stateSummary: document.getElementById("stateSummary"),
+        toggleShareBtn: document.getElementById("toggleShareBtn"),
+        resetRecordsBtn: document.getElementById("resetRecordsBtn"),
+        recordCountText: document.getElementById("recordCountText"),
+        recHeadline: document.getElementById("recHeadline"),
+        recDetail: document.getElementById("recDetail"),
+        video: document.getElementById("hiddenVideo"),
+        canvas: document.getElementById("hiddenCanvas"),
+        cards: {
+          left: document.getElementById("card-left"),
+          center: document.getElementById("card-center"),
+          right: document.getElementById("card-right")
+        },
+        subs: {
+          left: document.getElementById("sub-left"),
+          center: document.getElementById("sub-center"),
+          right: document.getElementById("sub-right")
+        }
+      };
+
+      function loadRecords() {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          const parsed = raw ? JSON.parse(raw) : [];
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      }
+
+      function saveRecords() {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state.records));
+        } catch (e) {
+          console.warn("localStorage 저장 실패:", e);
+        }
+        updateRecordCounter();
+      }
+
+      function updateRecordCounter() {
+        if (el.recordCountText) {
+          el.recordCountText.textContent = `누적 기록: ${state.records.length}건`;
+        }
+      }
+
+      function setErrorState(title, detail) {
+        if (el.liveDot) {
+          el.liveDot.classList.remove("live");
+          el.liveDot.classList.add("error");
+        }
+        if (el.statusText) el.statusText.textContent = "공유 오류/제한됨";
+        if (el.recHeadline) el.recHeadline.textContent = title;
+        if (el.recDetail) el.recDetail.textContent = detail;
+      }
+
+      function computeFrameSignature(ctx, w, h) {
+        const sample = ctx.getImageData(0, 0, w, h).data;
+        let sum = 0;
+        for (let i = 0; i < sample.length; i += 64) {
+          sum = (sum + sample[i] + sample[i + 1] * 2 + sample[i + 2] * 3) % 1000000007;
+        }
+        return String(sum);
+      }
+
+      function detectGameContext(ctx, w, h) {
+        // 좌측 상단 열쇠/층수/남은 횟수 패널 샘플링
+        const keyBadgeArea = ctx.getImageData(
+          Math.floor(w * 0.02),
+          Math.floor(h * 0.04),
+          Math.floor(w * 0.14),
+          Math.floor(h * 0.18)
+        ).data;
+        const leftPanel = ctx.getImageData(0, 0, Math.floor(w * 0.22), Math.floor(h * 0.45)).data;
+        const centerMsg = ctx.getImageData(
+          Math.floor(w * 0.32),
+          Math.floor(h * 0.62),
+          Math.floor(w * 0.36),
+          Math.floor(h * 0.16)
+        ).data;
+
+        let leftBright = 0;
+        let crimsonCount = 0;
+        let frostBlueCount = 0;
+        let legendGoldCount = 0;
+        let rareBlueCount = 0;
+
+        for (let i = 0; i < leftPanel.length; i += 16) {
+          const r = leftPanel[i];
+          const g = leftPanel[i + 1];
+          const b = leftPanel[i + 2];
+          if (r > 180 && g > 160) leftBright++;
+        }
+
+        for (let i = 0; i < keyBadgeArea.length; i += 12) {
+          const r = keyBadgeArea[i];
+          const g = keyBadgeArea[i + 1];
+          const b = keyBadgeArea[i + 2];
+          // 나락 화염(붉은/주황 계열), 서리(푸른/빙결 계열), 전설(황금), 희귀(청색)
+          if (r > 195 && g < 95 && b < 95) crimsonCount++;
+          if (b > 195 && r < 120 && g > 130) frostBlueCount++;
+          if (r > 205 && g > 155 && b < 70) legendGoldCount++;
+          if (b > 185 && r < 100 && g < 160) rareBlueCount++;
+        }
+
+        let detectedKeyType = state.keyType;
+        if (crimsonCount > frostBlueCount && crimsonCount > 18) {
+          detectedKeyType = "abyss_flame";
+        } else if (frostBlueCount > crimsonCount && frostBlueCount > 18) {
+          detectedKeyType = "abyss_frost";
+        } else if (crimsonCount <= 12 && frostBlueCount <= 12 && state.lastTurn === 0) {
+          detectedKeyType = "hell";
+        }
+
+        let detectedGrade = state.grade;
+        if (legendGoldCount > 35) {
+          detectedGrade = "legend";
+        } else if (rareBlueCount > 35) {
+          detectedGrade = "rare";
+        } else if (state.lastTurn === 0) {
+          detectedGrade = "hero";
+        }
+
+        let centerGold = 0;
+        for (let i = 0; i < centerMsg.length; i += 16) {
+          if (centerMsg[i] > 190 && centerMsg[i + 1] > 150 && centerMsg[i + 2] < 110) centerGold++;
+        }
+
+        const hasGambleAlert = centerGold > 25;
+        const estimatedFloor = state.lastFloor === null
+          ? 15
+          : Math.min(90, Math.max(1, state.lastFloor + (hasGambleAlert ? 12 : 11)));
+
+        const inferredRemaining = state.lastTurn === 0
+          ? (detectedGrade === "legend" ? 4 : 3)
+          : Math.max(0, state.remainingTurns - 1);
+
+        state.keyType = detectedKeyType;
+        state.grade = detectedGrade;
+        state.remainingTurns = inferredRemaining;
+
+        return {
+          floor: estimatedFloor,
+          hasGambleAlert,
+          brightnessScore: leftBright
+        };
+      }
+
+      function isSafeFloorForKey(floor, keyType) {
+        if (keyType === "abyss_flame") return floor % 2 === 0;
+        if (keyType === "abyss_frost") return (floor % 2 === 1) || floor === 100;
+        return true;
+      }
+
+      function syncRemainingTurnsSelect() {
+        // 선택 박스 없이 자동 관리됨
+      }
+
+      function scoreDirection(direction, ctxInfo) {
+        let score = 50;
+        const exactMatching = state.records.filter(
+          r => r.direction === direction && r.keyType === state.keyType && r.grade === state.grade
+        );
+        const keyMatching = state.records.filter(
+          r => r.direction === direction && r.keyType === state.keyType
+        );
+        const fallbackMatching = exactMatching.length > 0
+          ? exactMatching
+          : (keyMatching.length > 0
+            ? keyMatching
+            : state.records.filter(r => r.direction === direction));
+
+        if (fallbackMatching.length > 0) {
+          const avgDelta = fallbackMatching.reduce((acc, item) => acc + (item.delta || 10), 0) / fallbackMatching.length;
+          score += (avgDelta - 10) * 2.2;
+        }
+
+        if (direction === "center") {
+          score = ctxInfo.hasGambleAlert ? score + 18 : score - 28;
+        } else {
+          const stepBias = direction === "left" ? 1 : 2;
+          const nextFloor = Math.min(100, ctxInfo.floor + 10 + stepBias);
+          if (state.keyType === "abyss_flame" || state.keyType === "abyss_frost") {
+            const safeNow = isSafeFloorForKey(ctxInfo.floor, state.keyType);
+            score += safeNow ? 4 : -4;
+          } else if (ctxInfo.floor >= 65 && !ctxInfo.hasGambleAlert) {
+            score += direction === "right" ? 5 : 2;
+          } else {
+            score += direction === "left" ? 3 : 2;
+          }
+          if (state.grade === "legend" && state.remainingTurns <= 2 && !ctxInfo.hasGambleAlert) {
+            score += direction === "right" ? 3 : 1;
+          }
+          if (nextFloor >= 100 && state.keyType === "abyss_frost") {
+            score += 3;
+          }
+        }
+
+        return Math.round(score);
+      }
+
+      function appendAutoRecord(direction, ctxInfo) {
+        const prevFloor = state.lastFloor ?? 0;
+        const delta = Math.max(1, ctxInfo.floor - prevFloor);
+        const recordedRemainingTurns = state.remainingTurns;
+
+        state.records.push({
+          ts: Date.now(),
+          floor: ctxInfo.floor,
+          delta,
+          direction,
+          keyType: state.keyType,
+          grade: state.grade,
+          remainingTurns: recordedRemainingTurns,
+          gamble: ctxInfo.hasGambleAlert
+        });
+
+        if (state.records.length > 400) {
+          state.records.shift();
+        }
+
+        state.lastFloor = ctxInfo.floor;
+        state.lastTurn += 1;
+        if (state.remainingTurns > 0) {
+          state.remainingTurns -= 1;
+          syncRemainingTurnsSelect();
+        }
+        saveRecords();
+      }
+
+      function renderRecommendation(ctxInfo) {
+        const scores = {
+          left: scoreDirection("left", ctxInfo),
+          center: scoreDirection("center", ctxInfo),
+          right: scoreDirection("right", ctxInfo)
+        };
+
+        const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
+
+        ["left", "center", "right"].forEach(dir => {
+          const card = el.cards[dir];
+          if (!card) return;
+          card.classList.remove("active", "center-gamble");
+          el.subs[dir].textContent = `점수 ${scores[dir]}`;
+
+          if (dir === bestDir) {
+            card.classList.add("active");
+            if (dir === "center" && ctxInfo.hasGambleAlert) {
+              card.classList.add("center-gamble");
+            }
+            el.subs[dir].textContent = "추천 선택";
+          }
+        });
+
+        const labelMap = { left: "왼쪽", center: "가운데", right: "오른쪽" };
+        const keyName = KEY_LABELS[state.keyType] || "지옥 열쇠";
+        const gradeName = GRADE_LABELS[state.grade] || "영웅";
+        const sameComboCount = state.records.filter(
+          r => r.keyType === state.keyType && r.grade === state.grade
+        ).length;
+        const parityNote = state.keyType === "abyss_flame"
+          ? " · 짝수 층 생존"
+          : state.keyType === "abyss_frost"
+            ? " · 홀수 층 생존(100층 예외)"
+            : "";
+
+        el.recHeadline.textContent = `지금은 '${labelMap[bestDir]}' 추천`;
+        el.recDetail.textContent = ctxInfo.hasGambleAlert
+          ? `${keyName} · ${gradeName} · 남은 ${state.remainingTurns}회 · 도박성 감지 · ${sameComboCount}건 반영`
+          : `${keyName} · ${gradeName} · 남은 ${state.remainingTurns}회${parityNote} · 추정 ${ctxInfo.floor}층 · ${sameComboCount}건 반영`;
+        el.stateSummary.textContent = `${keyName} · ${gradeName} · 남은 ${state.remainingTurns}회 · 추정 ${ctxInfo.floor}층`;
+      }
+
+      function captureTick() {
+        if (!state.stream || !el.video || el.video.readyState < 2) return;
+
+        const w = 640;
+        const h = 360;
+        el.canvas.width = w;
+        el.canvas.height = h;
+        const ctx = el.canvas.getContext("2d");
+        ctx.drawImage(el.video, 0, 0, w, h);
+
+        const sig = computeFrameSignature(ctx, w, h);
+        if (sig === state.lastFrameSignature) return;
+        state.lastFrameSignature = sig;
+
+        const ctxInfo = detectGameContext(ctx, w, h);
+        const scores = {
+          left: scoreDirection("left", ctxInfo),
+          center: scoreDirection("center", ctxInfo),
+          right: scoreDirection("right", ctxInfo)
+        };
+        const bestDir = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
+
+        appendAutoRecord(bestDir, ctxInfo);
+        renderRecommendation(ctxInfo);
+      }
+
+      async function startShare() {
+        console.log("[지옥강하] startShare 호출:", {
+          href: window.location.href,
+          isSecureContext: window.isSecureContext,
+          hasMediaDevices: !!navigator.mediaDevices,
+          hasGetDisplayMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)
+        });
+
+        if (!window.isSecureContext) {
+          setErrorState(
+            "보안(HTTPS) 환경이 아닙니다",
+            "HTTPS로 서비스되는 독립 페이지에서 열어주세요."
+          );
+          return;
+        }
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+          setErrorState(
+            "이 브라우저/프레임에서는 화면 공유가 차단되어 있습니다",
+            "iframe 임베드 상태라면 Netlify 최상위 URL로 직접 열어주세요."
+          );
+          return;
+        }
+
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 15, max: 30 } },
+            audio: false
+          });
+
+          state.stream = stream;
+          el.video.srcObject = stream;
+          if (el.video.play) {
+            el.video.play().catch(() => {});
+          }
+
+          if (el.liveDot) {
+            el.liveDot.classList.remove("error");
+            el.liveDot.classList.add("live");
+          }
+          if (el.statusText) el.statusText.textContent = "자동 캡처 진행 중";
+          if (el.toggleShareBtn) el.toggleShareBtn.textContent = "공유 중지";
+
+          const track = stream.getVideoTracks()[0];
+          if (track) {
+            track.addEventListener("ended", () => stopShare(false));
+          }
+
+          clearInterval(state.timerId);
+          state.timerId = setInterval(captureTick, CAPTURE_INTERVAL_MS);
+          setTimeout(captureTick, 500);
+        } catch (err) {
+          console.error("[지옥강하] getDisplayMedia 오류:", err);
+          const errName = err && err.name ? err.name : "Error";
+          const errMsg = err && err.message ? err.message : "권한이 거부되었거나 임베드 정책으로 차단되었습니다.";
+          stopShare(true);
+          setErrorState(`화면 공유 시작 실패 (${errName})`, errMsg);
+        }
+      }
+
+      function stopShare(keepErrorDot = false) {
+        clearInterval(state.timerId);
+        state.timerId = null;
+
+        if (state.stream) {
+          state.stream.getTracks().forEach(t => {
+            try { t.stop(); } catch {}
+          });
+          state.stream = null;
+        }
+
+        if (el.video) {
+          el.video.srcObject = null;
+        }
+        if (el.liveDot) {
+          el.liveDot.classList.remove("live");
+          if (!keepErrorDot) {
+            el.liveDot.classList.remove("error");
+          }
+        }
+        if (!keepErrorDot && el.statusText) {
+          el.statusText.textContent = "화면 공유 대기 중";
+        }
+        if (el.toggleShareBtn) {
+          el.toggleShareBtn.textContent = "화면 공유 시작";
+        }
+      }
+
+      if (el.toggleShareBtn) {
+        el.toggleShareBtn.addEventListener("click", () => {
+          console.log("[지옥강하] 버튼 클릭 감지");
+          if (state.stream) {
+            stopShare(false);
+          } else {
+            startShare();
+          }
+        });
+      } else {
+        console.error("[지옥강하] toggleShareBtn 요소를 찾지 못했습니다.");
+      }
+
+      if (el.resetRecordsBtn) {
+        el.resetRecordsBtn.addEventListener("click", () => {
+          state.records = [];
+          state.lastFloor = null;
+          state.lastTurn = 0;
+          saveRecords();
+          if (el.recHeadline) el.recHeadline.textContent = "기록이 초기화되었습니다";
+          if (el.recDetail) el.recDetail.textContent = "다시 공유를 시작하면 새 기록이 쌓입니다.";
+        });
+      }
+
+      updateRecordCounter();
+    })();
+  </script>
+</body>
+</html>
