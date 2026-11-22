@@ -439,7 +439,7 @@
       const ABYSS_SIDE_OCR_MS = 1500;      // 부활 횟수·홀짝 안내 문구를 다시 읽는 간격
       const DEATH_HUD_GRACE_MS = 10000;    // 사망 층 도착 뒤 HUD의 부활 횟수가 늦게 바뀌는 동안은 이전 값 무시
 
-      const APP_VERSION = "ver.18";
+      const APP_VERSION = "ver.19";
       const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
 
       const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽", stop: "중단하고 보상 받기" };
@@ -637,6 +637,9 @@
         deadlyArrivalAt: 0,    // 사망 층에 도착한 시각
         abyssDeath: null,      // 직전 사망 { floor, revived }
         abyssFailed: false,    // 부활 없이 사망 → 보상 기회 소멸
+        hudAnchor: null,       // OCR로 찾은 '강하 N회 가능'·'부활 횟수' 줄 위치 (화면 픽셀)
+        sideText: { revive: "", hint: "" }, // 확인용: 부활 횟수·안내 문구에서 읽은 글자
+        ticker: null,          // 백그라운드에서도 멈추지 않는 판독 주기 (Web Worker)
         floor: null,           // 확정된 현재 층 (0 = 로비)
         turns: null,           // 확정된 남은 강하 횟수
         sideChoice: null,      // 이번 층에서 고른 왼쪽/오른쪽 (층이 바뀔 때만 새로 고름)
@@ -1389,7 +1392,8 @@
         const sx = Math.floor(vw * 0.02);
         const sy = Math.floor(vh * 0.025);
         const sw = Math.floor(vw * 0.12);
-        const sh = Math.floor(vh * 0.255);
+        // 창 모드에서는 제목 표시줄만큼 HUD가 아래로 밀리므로 '강하 N회 가능' 줄이 잘리지 않게 여유를 둠 (아래 층 목록 글자는 제외되는 높이)
+        const sh = Math.floor(vh * 0.265);
         const targetW = 480;
         const targetH = Math.max(120, Math.round(targetW * sh / sw));
 
@@ -1417,7 +1421,23 @@
           }
         }
         hctx.putImageData(imgData, 0, 0);
-        return { canvas: c, bits, color, width: targetW, height: targetH };
+        return { canvas: c, bits, color, width: targetW, height: targetH, sx, sy, sw, sh, vw, vh };
+      }
+
+      /* OCR 줄 위치로 '강하 N회 가능' 줄과 '부활 횟수' 줄이 화면 어디에 있는지 찾음.
+       * 게임을 창 모드(제목 표시줄 있음)로 띄우면 HUD가 아래로 밀려 고정 비율 위치로는 못 읽으므로,
+       * 실제로 읽힌 줄을 기준으로 부활 횟수·홀짝 안내 문구 위치를 잡음 */
+      function findHudAnchors(data, crop, out) {
+        const scaleY = crop.sh / crop.height;
+        (data && data.blocks || []).forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => {
+          const t = l.text || "";
+          if (!l.bbox) return;
+          const y0 = crop.sy + l.bbox.y0 * scaleY;
+          const y1 = crop.sy + l.bbox.y1 * scaleY;
+          if (!out.turns && /[강감]\s?[하허]\s*\S{1,3}\s*[회희화외]|[회희화외]\s*[가기]\s?[능늠]/.test(t)) out.turns = { y0, y1 };
+          if (!out.revive && /[부브]\s?[활화]\s?[횟회]|[횟회]\s?[수스]/.test(t)) out.revive = { y0, y1 };
+        })));
+        return out;
       }
 
       // 보조 판독용 회색조 이미지: 공유 화면은 색 정보가 절반 해상도로 줄어 전달되어
@@ -1604,6 +1624,8 @@
         if (state.revives === null) {
           state.revives = k;
         } else if (k < state.revives) {
+          // 줄어든 값은 잘못 읽으면 '중단' 추천으로 바뀌므로 3번 연속 같을 때만 반영
+          if (s.hits < STABLE_READS + 1) return;
           // 예상하지 못한 사망 (홀짝 규칙을 아직 몰랐던 경우 등) → 이번 층이 사망 층
           if (f && f < MAX_FLOOR && (state.abyssSafe === null || f % 2 !== state.abyssSafe)) {
             state.abyssSafe = 1 - (f % 2);
@@ -1781,12 +1803,43 @@
       const REVIVE_BOX = { x: 0.01, y: 0.165, w: 0.12, h: 0.03 };
       const HINT_BOX = { x: 0.01, y: 0.335, w: 0.15, h: 0.055 };
 
-      // 화면 일부를 잘라 읽음: luma = 밝기 기준 흑백(밝은 글씨 → 검은 글씨), color = 게임 화면 색 그대로
-      async function recognizeBox(box, W, mode) {
+      /* 부활 횟수 줄·홀짝 안내 문구를 읽을 위치 (화면 픽셀)
+       * 1순위: '강하 N회 가능' 줄 기준 (부활 줄은 약 69px 위, 안내 문구는 약 128px 아래, 1080p 기준 — 전체 화면·창 모드 모두 같음)
+       * 2순위: OCR로 찾은 '부활 횟수' 줄, 둘 다 없으면 고정 비율 위치 */
+      function sideRects() {
         const v = el.video;
         const vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
-        const sx = Math.floor(vw * box.x), sy = Math.floor(vh * box.y);
-        const sw = Math.max(1, Math.floor(vw * box.w)), sh = Math.max(1, Math.floor(vh * box.h));
+        const s = vh / 1080;
+        const a = state.hudAnchor && state.hudAnchor.vh === vh ? state.hudAnchor : null;
+        const turnsC = a && a.turns ? (a.turns.y0 + a.turns.y1) / 2 : null;
+        let revive = { x: vw * REVIVE_BOX.x, y: vh * REVIVE_BOX.y, w: vw * REVIVE_BOX.w, h: vh * REVIVE_BOX.h };
+        let hint = { x: vw * HINT_BOX.x, y: vh * HINT_BOX.y, w: vw * HINT_BOX.w, h: vh * HINT_BOX.h };
+        let from = "고정";
+        if (turnsC !== null) {
+          revive = { x: vw * 0.01, y: turnsC - 85 * s, w: vw * 0.12, h: 32 * s };
+          hint = { x: vw * 0.01, y: turnsC + 108 * s, w: vw * 0.15, h: 40 * s };
+          from = "강하 줄";
+        } else if (a && a.revive) {
+          const c = (a.revive.y0 + a.revive.y1) / 2;
+          revive = { x: vw * 0.01, y: c - 16 * s, w: vw * 0.12, h: 32 * s };
+          from = "부활 줄";
+        }
+        return { revive, hint, from };
+      }
+
+      function recognizeBox(box, W, mode) {
+        const v = el.video;
+        const vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
+        return recognizeRect({ x: vw * box.x, y: vh * box.y, w: vw * box.w, h: vh * box.h }, W, mode);
+      }
+
+      // 화면 일부(픽셀 영역)를 잘라 읽음: luma = 밝기 기준 흑백(밝은 글씨 → 검은 글씨), color = 게임 화면 색 그대로
+      async function recognizeRect(rect, W, mode) {
+        const v = el.video;
+        const vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
+        const sx = Math.max(0, Math.floor(rect.x)), sy = Math.max(0, Math.floor(rect.y));
+        const sw = Math.max(1, Math.min(vw - sx, Math.floor(rect.w)));
+        const sh = Math.max(1, Math.min(vh - sy, Math.floor(rect.h)));
         const H = Math.max(24, Math.round(W * sh / sw));
         const cv = state.sideCanvas || (state.sideCanvas = document.createElement("canvas"));
         cv.width = W;
@@ -1834,8 +1887,9 @@
       async function readAltarBanner() {
         const v = el.video;
         const vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
-        const sx = Math.floor(vw * 0.34), sy = Math.floor(vh * 0.115);
-        const sw = Math.floor(vw * 0.32), sh = Math.floor(vh * 0.08);
+        // 창 모드(제목 표시줄)로 화면이 아래로 밀려도 안내 줄이 들어오도록 위아래 여유를 둠
+        const sx = Math.floor(vw * 0.34), sy = Math.floor(vh * 0.105);
+        const sw = Math.floor(vw * 0.32), sh = Math.floor(vh * 0.11);
         const W = 760, H = Math.max(60, Math.round(W * sh / sw));
         const cv = state.bannerCanvas || (state.bannerCanvas = document.createElement("canvas"));
         cv.width = W;
@@ -1882,7 +1936,11 @@
           `제단: ${state.altarEffect ? (state.altarEffect.name || "효과") + " 확인" : (Date.now() < state.altarUntil ? state.altarFloor + "층 안내 확인 중" : "-")}`,
           `나락: ${state.abyss ? "예" : "아니오"} · 생존 층 ${state.abyssSafe === null ? "-" : PARITY_NAME[state.abyssSafe]}` +
             ` · 부활 ${show(state.revives)} (HUD ${show(state.reviveRead.value)}/${state.reviveRead.hits})` +
-            `${state.abyssFailed ? " · 보상 소멸" : ""}`
+            `${state.abyssFailed ? " · 보상 소멸" : ""}`,
+          `줄 위치: 강하 ${state.hudAnchor && state.hudAnchor.turns ? Math.round(state.hudAnchor.turns.y0) : "-"}` +
+            ` · 부활 ${state.hudAnchor && state.hudAnchor.revive ? Math.round(state.hudAnchor.revive.y0) : "-"}` +
+            ` · 부활 판독 ${state.sideText.revive || "-"} · 안내 ${state.sideText.hint || "-"}` +
+            ` · 화면 ${document.visibilityState}`
         ].forEach(t => {
           const line = document.createElement("span");
           line.textContent = t;
@@ -1912,18 +1970,21 @@
             const text = data && data.text ? data.text : "";
             parsed = parseHudText(text);
             if (parsed.ended && parsed.turns === null) parsed.turns = 0; // 판 종료 화면 = 남은 강하 0회
+            const anchors = findHudAnchors(data, crop, {});
             // 글자 줄은 보이는데 숫자를 못 읽었으면 회색조 → 원본 색 그대로 순서로 다시 읽어 빈 값만 채움
             for (const mode of ["luma", "max", "color"]) {
               const needTurns = parsed.turns === null && /[강감]\s?[하허]|가\s?[능늠]/.test(text);
               // '강하 N회' 줄이 보이면 HUD가 떠 있는 것이므로 제목(층수)이 깨져 읽혀도 다시 읽음 (나락 HUD 배경이 밝아 깨지기 쉬움)
               const needFloor = parsed.floor === null && (parsed.turns !== null || /지\s?[하허히]|로\s?비/.test(text));
               if (!needTurns && !needFloor) break;
-              const r2 = await state.ocrWorker.recognize(makeGrayCanvas(crop, mode));
+              const r2 = await state.ocrWorker.recognize(makeGrayCanvas(crop, mode), {}, { text: true, blocks: true });
               const p2 = parseHudText(r2.data && r2.data.text ? r2.data.text : "");
               if (needTurns && p2.turns !== null) { parsed.turns = p2.turns; parsed.assisted = true; }
               if (needFloor && p2.floor !== null) { parsed.floor = p2.floor; parsed.assisted = true; }
               if (p2.abyss) parsed.abyss = true;
+              findHudAnchors(r2.data, crop, anchors);
             }
+            if (anchors.turns || anchors.revive) state.hudAnchor = { ...anchors, vh: crop.vh, at: now };
             state.lastParsed = parsed;
             state.lastHudBits = crop.bits;
             state.watchBoxes = findWatchBoxes(data || {}, width, crop.canvas.height);
@@ -1936,13 +1997,24 @@
           }
           applyHudReading(parsed);
           // 나락: 부활 횟수 줄과 로비의 홀짝 안내 문구를 따로 잘라 읽음 (일정 간격)
-          if (state.abyss && Date.now() - state.lastSideOcrAt >= ABYSS_SIDE_OCR_MS) {
+          // 층·횟수가 바뀌는 중(확정 전)이면 확정 판독을 먼저 하도록 이번에는 건너뜀
+          const pendingChange = (parsed.floor !== null && parsed.floor !== state.floor) ||
+            (parsed.turns !== null && parsed.turns !== state.turns);
+          if (state.abyss && !pendingChange && Date.now() - state.lastSideOcrAt >= ABYSS_SIDE_OCR_MS) {
             state.lastSideOcrAt = Date.now();
+            const rects = sideRects();
             if (state.abyssSafe === null) {
-              applyParityReading(parseParityText(await recognizeBox(HINT_BOX, 720, "color")));
+              const hintText = await recognizeRect(rects.hint, 720, "color");
+              state.sideText.hint = hintText.replace(/\s+/g, " ").trim().slice(0, 40);
+              applyParityReading(parseParityText(hintText));
             }
-            let k = parseReviveText(await recognizeBox(REVIVE_BOX, 480, "luma"));
-            if (k === null) k = parseReviveText(await recognizeBox(REVIVE_BOX, 480, "color"));
+            let reviveText = await recognizeRect(rects.revive, 480, "luma");
+            let k = parseReviveText(reviveText);
+            if (k === null) {
+              reviveText = await recognizeRect(rects.revive, 480, "color");
+              k = parseReviveText(reviveText);
+            }
+            state.sideText.revive = `${rects.from}: ${reviveText.replace(/\s+/g, " ").trim().slice(0, 30)}`;
             applyReviveReading(k);
           }
           if (!state.altarEffect && Date.now() < state.altarUntil) {
@@ -2000,8 +2072,7 @@
           const track = stream.getVideoTracks()[0];
           if (track) track.addEventListener("ended", () => stopShare(false));
 
-          clearInterval(state.timerId);
-          state.timerId = setInterval(captureTick, OCR_INTERVAL_MS);
+          startTicker();
           refreshRecommendation(false);
           initOcr();
         } catch (err) {
@@ -2012,9 +2083,43 @@
         }
       }
 
-      function stopShare(keepErrorDot = false) {
+      /* 판독 주기: 브라우저 창이 게임 창에 가려지면 브라우저가 페이지 타이머를 크게 늦추므로(최대 1분에 1번)
+       * Web Worker 타이머로 주기를 돌려 가려져 있어도 계속 읽음. Worker를 못 쓰면 일반 타이머 사용 */
+      function startTicker() {
+        stopTicker();
+        try {
+          const src = "let t=null;onmessage=e=>{clearInterval(t);if(e.data>0)t=setInterval(()=>postMessage(0),e.data);};";
+          const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+          const w = new Worker(url);
+          URL.revokeObjectURL(url);
+          w.onmessage = () => captureTick();
+          w.onerror = () => {
+            stopTicker();
+            state.timerId = setInterval(captureTick, OCR_INTERVAL_MS);
+          };
+          w.postMessage(OCR_INTERVAL_MS);
+          state.ticker = w;
+        } catch (err) {
+          state.timerId = setInterval(captureTick, OCR_INTERVAL_MS);
+        }
+      }
+
+      function stopTicker() {
+        if (state.ticker) {
+          try { state.ticker.terminate(); } catch {}
+          state.ticker = null;
+        }
         clearInterval(state.timerId);
         state.timerId = null;
+      }
+
+      // 다시 보이게 되면 바로 한 번 읽음
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible" && state.stream) captureTick();
+      });
+
+      function stopShare(keepErrorDot = false) {
+        stopTicker();
 
         if (state.stream) {
           state.stream.getTracks().forEach(t => {
