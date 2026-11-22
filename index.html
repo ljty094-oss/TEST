@@ -185,6 +185,36 @@
       letter-spacing: -0.5px;
     }
 
+    /* 70층 이상 10층 단위 층: 추천(진하게) + 함께 제시하는 다른 선택(점선) */
+    .dir-card.alt {
+      opacity: 0.9;
+      border-style: dashed;
+      border-color: rgba(79, 140, 255, 0.75);
+    }
+
+    .dir-card.alt.center-gamble {
+      border-color: rgba(245, 185, 66, 0.85);
+    }
+
+    .dir-tag {
+      margin-top: 8px;
+      font-size: 15px;
+      font-weight: 700;
+      color: #a7c7ff;
+    }
+
+    .dir-tag:empty {
+      display: none;
+    }
+
+    .dir-card.center-gamble .dir-tag {
+      color: var(--gold);
+    }
+
+    .rec-line {
+      display: block;
+    }
+
 
 
     .summary-card {
@@ -349,12 +379,15 @@
     <div class="direction-grid">
       <div id="card-left" class="dir-card">
         <div class="dir-name">왼쪽</div>
+        <div id="tag-left" class="dir-tag"></div>
       </div>
       <div id="card-center" class="dir-card">
         <div id="centerName" class="dir-name">가운데</div>
+        <div id="tag-center" class="dir-tag"></div>
       </div>
       <div id="card-right" class="dir-card">
         <div class="dir-name">오른쪽</div>
+        <div id="tag-right" class="dir-tag"></div>
       </div>
     </div>
 
@@ -397,6 +430,14 @@
       const REMOTE_REFRESH_MS = 60000;
       const REMOTE_PAGE_SIZE = 1000;
       const REMOTE_MAX_PAGES = 10;
+      // 첫 접속 때만 전체 기록을 받고, 이후에는 새 기록(번호가 더 큰 기록)만 받음.
+      // 거의 동시에 저장된 기록이 조금 늦게 보이는 경우를 대비해 마지막 번호보다 이만큼 앞부터 다시 확인 (겹치는 기록은 1건으로 처리)
+      const REMOTE_ID_OVERLAP = 20;
+      // 같은 사람의 같은 이동(출발층→도착층)이 이 시간 안에 또 기록되면 중복으로 보고 1건만 반영
+      const DUPLICATE_MOVE_MS = 3000;
+      // 이 층 이상 10층 단위 층(70·80·90층)에서는 안정(왼쪽/오른쪽 중 1곳)·도박(가운데)을 함께 제시하고,
+      // 데이터 수집 중이어도 남은 강하 횟수까지 계산해 유리한 쪽을 추천으로 강조
+      const DUAL_MIN_FLOOR = 70;
 
       /* 공식 규칙 — 로스트아크 공식 게임 가이드 '낙원', 2025-09-09 업데이트 공지
        * - 왼쪽/오른쪽: 1~20층 무작위, 각 층 확률 동일
@@ -439,7 +480,7 @@
       const ABYSS_SIDE_OCR_MS = 1500;      // 부활 횟수·홀짝 안내 문구를 다시 읽는 간격
       const DEATH_HUD_GRACE_MS = 10000;    // 사망 층 도착 뒤 HUD의 부활 횟수가 늦게 바뀌는 동안은 이전 값 무시
 
-      const APP_VERSION = "ver.19";
+      const APP_VERSION = "ver.20";
       const DEBUG = new URLSearchParams(window.location.search).get("debug") === "1";
 
       const LABEL = { left: "왼쪽", center: "가운데", right: "오른쪽", stop: "중단하고 보상 받기" };
@@ -646,7 +687,9 @@
         cheerIndex: 0,
         rec: null,             // 현재 표시 중인 추천
         records: loadRecords(),
-        remote: null,          // 서버에서 읽은 전체 기록 (실패 시 null)
+        remote: null,          // 서버에서 읽은 전체 기록 (아직 못 읽었으면 null)
+        remoteKeys: new Set(), // 서버 기록 구분값(사용자|시각) — 같은 기록을 두 번 반영하지 않도록
+        remoteMaxId: 0,        // 지금까지 받은 서버 기록의 가장 큰 번호 (다음에는 이보다 새 기록만 받음)
         dbStatus: "확인 전",
         inFlight: new Set()    // 전송 중인 기록 (중복 전송 방지)
       };
@@ -670,6 +713,11 @@
           left: document.getElementById("card-left"),
           center: document.getElementById("card-center"),
           right: document.getElementById("card-right")
+        },
+        tags: {
+          left: document.getElementById("tag-left"),
+          center: document.getElementById("tag-center"),
+          right: document.getElementById("tag-right")
         }
       };
 
@@ -808,7 +856,10 @@
         if (ok) {
           record.synced = true;
           saveRecords();
-          if (state.remote) state.remote.push(Object.assign({}, record));
+          if (state.remote && !state.remoteKeys.has(key)) {
+            state.remoteKeys.add(key); // 다음에 서버에서 같은 기록을 받아도 다시 더하지 않음
+            state.remote.push(Object.assign({}, record));
+          }
         }
         render();
         return ok;
@@ -824,22 +875,28 @@
         }
       }
 
+      // 첫 접속: 전체 기록(최신순, 최대 1만 건) / 이후 1분마다: 이미 받은 기록보다 번호가 큰 새 기록만
       async function fetchRemoteRecords() {
         if (!isSupabaseConfigured()) return;
+        const incremental = Boolean(state.remote) && state.remoteMaxId > 0;
         const rows = [];
         try {
           for (let page = 0; page < REMOTE_MAX_PAGES; page++) {
-            const q = new URLSearchParams({
-              select: "user_id,recorded_at,floor,delta,direction,remaining_turns,gamble",
+            const params = {
+              select: "id,user_id,recorded_at,floor,delta,direction,remaining_turns,gamble",
               recorded_at: `gte.${DATA_SINCE}`,
-              order: "recorded_at.desc",
+              order: incremental ? "id.asc" : "recorded_at.desc",
               limit: String(REMOTE_PAGE_SIZE),
               offset: String(page * REMOTE_PAGE_SIZE)
-            });
+            };
+            if (incremental) params.id = `gt.${Math.max(0, state.remoteMaxId - REMOTE_ID_OVERLAP)}`;
+            const q = new URLSearchParams(params);
             const res = await fetch(`${dbEndpoint()}?${q.toString()}`, { headers: dbHeaders() });
             if (!res.ok) {
-              state.dbStatus = `읽기 실패 (${res.status}) — 내 기기 기록만 사용`;
-              state.remote = null;
+              // 이미 받아 둔 기록이 있으면 그대로 쓰고 다음 주기에 새 기록만 다시 시도
+              state.dbStatus = state.remote
+                ? `새 기록 읽기 실패 (${res.status}) — 받아 둔 기록 ${state.remote.length}건으로 계속`
+                : `읽기 실패 (${res.status}) — 내 기기 기록만 사용`;
               refreshRecommendation(false);
               return;
             }
@@ -847,28 +904,70 @@
             rows.push(...chunk);
             if (chunk.length < REMOTE_PAGE_SIZE) break;
           }
-          state.remote = rows
-            .map(fromDbRow)
-            .filter(r => ["left", "center", "right"].includes(r.direction) && isPossibleMove(r.floorBefore, r.floorAfter));
-          state.dbStatus = `연결됨 · 수집 기록 ${state.remote.length}건 반영`;
+          mergeRemoteRows(rows, !incremental);
+          state.dbStatus = `연결됨 · 수집 기록 ${state.remote.length}건 반영` +
+            (incremental ? ` (새로 받은 기록 ${rows.length}건 확인)` : " (전체 받음)");
         } catch (err) {
-          state.dbStatus = "읽기 실패 (네트워크) — 내 기기 기록만 사용";
-          state.remote = null;
+          state.dbStatus = state.remote
+            ? `새 기록 읽기 실패 (네트워크) — 받아 둔 기록 ${state.remote.length}건으로 계속`
+            : "읽기 실패 (네트워크) — 내 기기 기록만 사용";
         }
         refreshRecommendation(false);
         retryUnsynced();
+      }
+
+      // 서버에서 받은 기록 합치기: 같은 기록(사용자|시각)은 1건만, 통계에 못 쓰는 기록·중복 이동은 제외
+      function mergeRemoteRows(rows, full) {
+        if (full || !state.remote) {
+          state.remote = [];
+          state.remoteKeys = new Set();
+          state.remoteMaxId = 0;
+        }
+        rows.forEach(row => {
+          const id = Number(row.id);
+          if (Number.isFinite(id) && id > state.remoteMaxId) state.remoteMaxId = id;
+          const r = fromDbRow(row);
+          if (!["left", "center", "right"].includes(r.direction) || !isPossibleMove(r.floorBefore, r.floorAfter)) return;
+          const key = `${r.userId}|${r.ts}`;
+          if (state.remoteKeys.has(key)) return;
+          state.remoteKeys.add(key);
+          state.remote.push(r);
+        });
+        state.remote = dropDuplicateMoves(state.remote);
+        const cap = REMOTE_PAGE_SIZE * REMOTE_MAX_PAGES;
+        if (state.remote.length > cap) state.remote = state.remote.slice(-cap); // 최신 1만 건만 사용 (위에서 시간순 정렬됨)
+      }
+
+      // 층 오인식 등으로 같은 사람의 같은 이동(출발층→도착층)이 DUPLICATE_MOVE_MS 안에 또 기록된 경우 첫 기록만 남김.
+      // 정상적인 연속 강하는 출발층이 매번 바뀌므로 빠르게 내려가도 지워지지 않음
+      function isDuplicateMove(prev, r) {
+        return Boolean(prev) && prev.floorBefore === r.floorBefore && prev.floorAfter === r.floorAfter &&
+          r.ts - prev.ts >= 0 && r.ts - prev.ts <= DUPLICATE_MOVE_MS;
+      }
+      function dropDuplicateMoves(list) {
+        const lastByUser = new Map();
+        return list.slice().sort((a, b) => a.ts - b.ts).filter(r => {
+          if (isDuplicateMove(lastByUser.get(r.userId), r)) return false;
+          lastByUser.set(r.userId, r);
+          return true;
+        });
       }
 
       // 서버 기록 + 아직 서버에 없는 내 기기 기록
       function allRecords() {
         const local = state.records.filter(r => isPossibleMove(r.floorBefore, r.floorAfter));
         if (!state.remote) return local;
-        const seen = new Set(state.remote.map(r => `${r.userId}|${r.ts}`));
-        return state.remote.concat(local.filter(r => !seen.has(`${r.userId}|${r.ts}`)));
+        return state.remote.concat(local.filter(r => !state.remoteKeys.has(`${r.userId}|${r.ts}`)));
       }
 
       function appendMoveRecord(move) {
-        const record = Object.assign({ userId: state.userId, ts: Date.now(), synced: false }, move);
+        const now = Date.now();
+        let prev = null;
+        for (let i = state.records.length - 1; i >= 0; i--) {
+          if (state.records[i].userId === state.userId) { prev = state.records[i]; break; }
+        }
+        if (isDuplicateMove(prev, { floorBefore: move.floorBefore, floorAfter: move.floorAfter, ts: now })) return; // 같은 이동 중복 기록 방지
+        const record = Object.assign({ userId: state.userId, ts: now, synced: false }, move);
         state.records.push(record);
         if (state.records.length > 3000) state.records.shift();
         saveRecords();
@@ -1153,7 +1252,7 @@
       function refreshRecommendation(arrivedNewFloor) {
         const f = state.floor;
         const r = state.turns;
-        const rec = { active: false, direction: null, centerAvailable: false, floor: f, turns: r, headline: "", detail: "", parts: null, tone: null, cheer: "" };
+        const rec = { active: false, direction: null, alt: null, dual: null, centerAvailable: false, floor: f, turns: r, headline: "", detail: "", parts: null, tone: null, cheer: "" };
 
         if (f === null) {
           rec.headline = state.stream ? "HUD에서 현재 층수를 읽는 중입니다" : "공유를 시작하면 자동으로 추천합니다";
@@ -1235,7 +1334,15 @@
 
         if (rec.centerAvailable) {
           const grand = estimateGrandRate(data);
-          if (grand.sd > CENTER_DATA_SD) {
+          if (f >= DUAL_MIN_FLOOR) {
+            // 70·80·90층: 안정(왼쪽/오른쪽 중 1곳)과 도박(가운데)을 함께 제시.
+            // 데이터 수집 중이어도 현재 추정 대강하 비율로 남은 강하 동안의 기대 보상을 계산해 유리한 쪽을 추천
+            const q = makeSolver(grand.mean).Q(f, turnsForCalc);
+            const centerBetter = q.center > q.side;
+            rec.direction = centerBetter ? "center" : state.sideChoice;
+            rec.alt = centerBetter ? state.sideChoice : "center";
+            rec.dual = { stable: state.sideChoice, centerBetter, grand, q };
+          } else if (grand.sd > CENTER_DATA_SD) {
             // 가운데 데이터가 쌓일 때까지는 가운데 추천
             rec.direction = "center";
           } else {
@@ -1248,6 +1355,23 @@
         rec.detail = moveText();
 
         rec.headline = `지금은 '${LABEL[rec.direction]}' 추천`;
+        if (rec.dual) {
+          const d = rec.dual;
+          const stableName = LABEL[d.stable];
+          rec.headline = d.centerBetter
+            ? `지금은 '가운데' 추천 (도박) · 안정 선택은 '${stableName}'`
+            : `지금은 '${stableName}' 추천 (안정) · 도박 선택은 '가운데'`;
+          const grandPct = Math.round(d.grand.mean * 100);
+          const hi = Math.max(d.q.center, d.q.side);
+          const lo = Math.min(d.q.center, d.q.side);
+          const gap = lo > 0 ? (hi - lo) / lo * 100 : 0;
+          const gapText = gap < 1 ? "근소하게(1% 미만)" : `약 ${Math.round(gap)}%`;
+          const where = r === null ? "남은 강하를 3회로 가정하면" : `이 층·남은 ${r}회에선`;
+          rec.parts = [
+            { text: `가운데: 대강하 약 ${grandPct}% · 상승 약 ${100 - grandPct}% (${d.grand.n ? `데이터 ${d.grand.n}건` : "데이터 없음, 기본값"})`, cls: "rec-line" },
+            { text: `${where} ${d.centerBetter ? "도박" : "안정"} 쪽 기대 보상이 ${gapText} 높습니다.`, cls: "rec-line" }
+          ];
+        }
         rec.cheer = moveCheer(rec.direction, r) || CHEER_MESSAGES[rec.direction][state.cheerIndex % 3];
         state.rec = rec;
         if (!state.departureLocked) state.departureRec = rec;
@@ -1282,12 +1406,23 @@
         const target = rec.direction === "stop" ? "center" : rec.direction;
         ["left", "center", "right"].forEach(dir => {
           const card = el.cards[dir];
-          card.classList.remove("active", "center-gamble", "stop");
+          card.classList.remove("active", "alt", "center-gamble", "stop");
           if (rec.active && dir === target) {
             card.classList.add("active");
             if (rec.direction === "stop") card.classList.add("stop");
             else if (dir === "center") card.classList.add("center-gamble");
+          } else if (rec.active && rec.alt === dir) {
+            // 70층 이상: 추천과 함께 제시하는 다른 선택 (안정 또는 도박)
+            card.classList.add("alt");
+            if (dir === "center") card.classList.add("center-gamble");
           }
+          let tag = "";
+          if (rec.active && rec.dual) {
+            const star = rec.direction === dir ? " ★추천" : "";
+            if (dir === "center") tag = `도박${star}`;
+            else if (dir === rec.dual.stable) tag = `안정${star}`;
+          }
+          if (el.tags[dir]) el.tags[dir].textContent = tag;
         });
 
         el.recHeadline.textContent = rec.headline;
@@ -1940,7 +2075,8 @@
           `줄 위치: 강하 ${state.hudAnchor && state.hudAnchor.turns ? Math.round(state.hudAnchor.turns.y0) : "-"}` +
             ` · 부활 ${state.hudAnchor && state.hudAnchor.revive ? Math.round(state.hudAnchor.revive.y0) : "-"}` +
             ` · 부활 판독 ${state.sideText.revive || "-"} · 안내 ${state.sideText.hint || "-"}` +
-            ` · 화면 ${document.visibilityState}`
+            ` · 화면 ${document.visibilityState}`,
+          `데이터: 수집 기록 ${state.remote ? state.remote.length + "건" : "없음"} · 마지막 번호 ${state.remoteMaxId || "-"} · ${state.dbStatus}`
         ].forEach(t => {
           const line = document.createElement("span");
           line.textContent = t;
